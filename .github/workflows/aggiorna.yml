@@ -1,0 +1,59 @@
+# Ogni 2 ore scarica i dati Garmin, cifra la pagina con la password e la pubblica su GitHub Pages.
+name: Aggiorna dashboard
+
+on:
+  schedule:
+    - cron: "15 */2 * * *"
+  workflow_dispatch:  # pulsante "Run workflow" per aggiornare subito
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    env:
+      TZ: Europe/Rome  # "oggi" deve essere quello italiano, non UTC
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scarica dati e genera index.html
+        env:
+          GARMINTOKENS: ${{ secrets.GARMINTOKENS }}
+        run: |
+          pip install garminconnect==0.2.40 garth==0.6.3 requests
+          python dashboard.py
+
+      - name: Proteggi con password
+        env:
+          PAGE_PASSWORD: ${{ secrets.PAGE_PASSWORD }}
+        run: |
+          # sale fisso: cosi' "ricordami" resta valido tra un aggiornamento e l'altro
+          npx --yes staticrypt@3.5.4 index.html -p "$PAGE_PASSWORD" -d site \
+            --salt 3fd544d63d00c2613c8982f5d9cc5f5b --remember 60 \
+            --template-title "Corsa" --template-instructions "Inserisci la password della dashboard" \
+            --template-button "Apri" --template-placeholder "Password" \
+            --template-remember "Ricordami su questo telefono" \
+            --template-error "Password sbagliata" \
+            --template-color-primary "#ff6b2c" --template-color-secondary "#000000"
+          # rende la pagina installabile come app sul telefono
+          sed -i 's#</head>#<link rel="manifest" href="manifest.json"><link rel="apple-touch-icon" href="icon.png"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Corsa"><meta name="theme-color" content="\#000000"></head>#' site/index.html
+          cp app/manifest.json app/icon.png site/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4

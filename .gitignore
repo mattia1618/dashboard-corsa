@@ -1,0 +1,10 @@
+# dati personali e file locali: NON vanno nel repository pubblico
+index.html
+site/
+__pycache__/
+.claude/
+.agents/
+.impeccable/
+CLAUDE.md
+skills-lock.json
+python dashboard.py.txt
