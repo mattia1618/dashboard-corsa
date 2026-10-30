@@ -37,7 +37,7 @@ from datetime import date, datetime, timedelta
 # ----------------------------------------------------------------------------
 # CONFIGURAZIONE
 # ----------------------------------------------------------------------------
-RACE_DATE = date(2026, 11, 15)
+RACE_DATE = date(2026, 11, 8)
 RACE_NAME = "10 km"
 
 ATHLETE = {
@@ -657,7 +657,7 @@ def compute_insights(load_series, mileage, vo2_series, days_left):
         tsb = load_series[-1]["tsb"]
         if tsb < -15 and taper:
             insights.append({"color": "danger", "title": f"Stanco a {days_left} giorni dalla gara",
-                              "text": f"Freschezza a {tsb}: è il momento di scaricare. Riduci il volume del 20-30% a settimana e tieni una sola seduta breve a ritmo gara: la freschezza risalirà in tempo per il 15/11."})
+                              "text": f"Freschezza a {tsb}: è il momento di scaricare. Riduci il volume del 20-30% a settimana e tieni una sola seduta breve a ritmo gara: la freschezza risalirà in tempo per il {RACE_DATE.strftime('%d/%m')}."})
         elif tsb < -15:
             insights.append({"color": "danger", "title": "Fatica alta",
                               "text": f"Freschezza a {tsb}: la fatica è parecchio sopra la forma fisica. Meglio 2-3 giorni facili prima della prossima sessione di qualità."})
@@ -796,8 +796,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .container {{ max-width: 1180px; margin: 0 auto; }}
   .num, .v, .km, table {{ font-variant-numeric: tabular-nums; }}
 
-  .stale {{ background: color-mix(in srgb, var(--accent2) 10%, var(--panel)); border: 1px solid color-mix(in srgb, var(--accent2) 35%, var(--panel-border)); color: var(--text); border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; }}
-  .stale code {{ color: var(--accent2); }}
 
   .top-grid {{ display: grid; grid-template-columns: 1.1fr 2fr; gap: 16px; margin-bottom: 16px; }}
   .hero {{ background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px; padding: 22px; }}
@@ -871,7 +869,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .badge.easy {{ background: rgba(104,211,145,0.15); color: var(--good); }}
   .badge.workout {{ background: rgba(246,173,85,0.15); color: var(--accent2); }}
   .muted {{ color: var(--muted); }}
-  footer {{ text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; }}
   canvas {{ max-height: 260px; }}
 
   .modal-overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 50; align-items: center; justify-content: center; opacity: 0; transition: opacity .18s; }}
@@ -931,8 +928,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="container">
 
-  <div class="stale" id="staleBanner" hidden>Dati aggiornati al {generated_at}. Si aggiornano da soli ogni 2 ore: se questo avviso resta, controlla la scheda Actions su GitHub (o rilancia <code>python dashboard.py</code> sul PC).</div>
-
   <div class="top-grid">
     <div class="hero">
       <h1>Gara {race_name} · {race_date_str}</h1>
@@ -969,7 +964,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="grid" style="margin-top:18px;">
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Chilometraggio settimanale" onclick="openEnlarge('mileage')"><h2>Chilometraggio settimanale</h2><div class="desc">Ultime {weeks_trend} settimane di corsa (la data è il lunedì), con la linea di tendenza.</div>{mileage_chart_or_missing}</div>
     </div>
-    <p class="muted" style="margin-top:12px; font-size:13px;">Forma fisica, fatica e freschezza sono una stima calcolata dal carico Garmin, non un dato ufficiale.</p>
   </div>
 
   <div class="section" id="section-recovery" role="tabpanel" aria-labelledby="tab-recovery">
@@ -989,7 +983,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <footer>Generato da dashboard.py il {generated_at} · Aggiornamento automatico ogni 2 ore</footer>
 </div>
 
 <!-- Modal dettaglio attività (percorso + grafici) -->
@@ -1161,7 +1154,6 @@ try {{
       b.setAttribute('aria-current', 'date');
     }}
   }});
-  if (GENERATED_ISO !== todayIso) document.getElementById('staleBanner').hidden = false;
 }} catch (e) {{ console.error('Errore data di oggi', e); }}
 
 /* ---------- grafico ingrandito con selettore Oggi/Settimana/Mese/Tutto ---------- */
