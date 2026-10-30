@@ -750,14 +750,6 @@ def json_for_script(obj):
     return json.dumps(obj).replace("</", "<\\/")
 
 
-def flatten_for_json(obj):
-    try:
-        json.dumps(obj)
-        return obj
-    except TypeError:
-        return json.loads(json.dumps(obj, default=str))
-
-
 # ----------------------------------------------------------------------------
 # HTML TEMPLATE
 # ----------------------------------------------------------------------------
@@ -901,8 +893,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .mini-stat-row {{ display: flex; gap: 16px; margin-bottom: 6px; }}
   .mini-stat-row .ms {{ font-size: 12px; color: var(--muted); }}
   .mini-stat-row .ms strong {{ display: block; font-size: 15px; color: var(--text); font-weight: 700; }}
-  details.raw-toggle {{ margin-top: 14px; }}
-  details.raw-toggle summary {{ cursor: pointer; color: var(--muted); font-size: 13px; }}
 
   @media (prefers-reduced-motion: reduce) {{
     .modal-overlay, .modal-box {{ transition: none; }}
@@ -993,10 +983,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="modal-close" onclick="closeModal('detailModal')">Chiudi</button>
     </div>
     <div id="detailBody"></div>
-    <details class="raw-toggle">
-      <summary>Mostra tutti i dati grezzi Garmin</summary>
-      <table class="detail-table"><tbody id="detailRawTable"></tbody></table>
-    </details>
   </div>
 </div>
 
@@ -1245,32 +1231,8 @@ function sparkline(elemId, values, color, labels) {{
 }}
 
 /* ---------- dettaglio attività: percorso animato + 4 grafici ---------- */
-const ACTIVITY_DETAILS = {activity_details_json};
 const ACTIVITY_TIMESERIES = {activity_timeseries_json};
 const ACTIVITY_SUMMARY = {activity_summary_json};
-
-function flattenObj(obj, prefix) {{
-  prefix = prefix || '';
-  let rows = [];
-  if (!obj || typeof obj !== 'object') return rows;
-  for (const k in obj) {{
-    const v = obj[k];
-    if (v === null || v === undefined || v === '') continue;
-    const key = prefix ? prefix + '.' + k : k;
-    if (typeof v === 'object' && !Array.isArray(v)) {{
-      rows = rows.concat(flattenObj(v, key));
-    }} else if (Array.isArray(v)) {{
-      if (v.length > 0 && typeof v[0] === 'object') {{
-        rows.push([key, v.length + ' elementi (dati grezzi disponibili)']);
-      }} else {{
-        rows.push([key, v.join(', ')]);
-      }}
-    }} else {{
-      rows.push([key, String(v)]);
-    }}
-  }}
-  return rows;
-}}
 
 function buildRouteSvg(lat, lon) {{
   const W = 600, H = 220, PAD = 14;
@@ -1319,7 +1281,6 @@ function animateRoute() {{
 }}
 
 function openDetail(activityId, title) {{
-  const data = ACTIVITY_DETAILS[activityId];
   const ts = ACTIVITY_TIMESERIES[activityId];
   document.getElementById('detailTitle').textContent = title;
 
@@ -1393,20 +1354,6 @@ function openDetail(activityId, title) {{
 
   body.appendChild(grid);
 
-  const rawTbody = document.getElementById('detailRawTable');
-  rawTbody.innerHTML = '';
-  if (!data) {{
-    rawTbody.innerHTML = '<tr><td colspan="2">Nessun dettaglio disponibile.</td></tr>';
-  }} else {{
-    flattenObj(data).forEach(([k, v]) => {{
-      const tr = document.createElement('tr');
-      tr.innerHTML = '<td>' + k + '</td><td></td>';
-      tr.children[1].textContent = v;
-      rawTbody.appendChild(tr);
-    }});
-  }}
-
-  document.querySelector('#detailModal details.raw-toggle').open = false;
   openModal('detailModal');
 
   setTimeout(() => {{
@@ -1505,7 +1452,6 @@ def main():
     recent_activities_raw = [a for a in activities if str(a.get("activityId")) in {r["activity_id"] for r in recent_rows}]
     activity_details, activity_timeseries = fetch_activity_details(client, recent_activities_raw)
     activity_summary = {str(a.get("activityId")): build_activity_summary(activity_details.get(str(a.get("activityId")), a)) for a in recent_activities_raw}
-    activity_details = {aid: flatten_for_json(d) for aid, d in activity_details.items()}
 
     card_ctl = f"{load_series[-1]['ctl']}" if load_series else "—"
     card_atl = f"{load_series[-1]['atl']}" if load_series else "—"
@@ -1665,7 +1611,6 @@ new Chart(document.getElementById('sleepChart'), {{
         "table_or_missing": table_html or '<div class="missing">Nessuna corsa nelle ultime settimane.</div>',
         "chart_scripts": "\n".join(chart_scripts),
         "chartjs_source": chartjs_source,
-        "activity_details_json": json_for_script(activity_details),
         "activity_timeseries_json": json_for_script(activity_timeseries),
         "activity_summary_json": json_for_script(activity_summary),
     }
