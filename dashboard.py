@@ -33,12 +33,15 @@ import os
 import sys
 import time
 from datetime import date, datetime, timedelta
+from html import escape
 
 # ----------------------------------------------------------------------------
 # CONFIGURAZIONE
 # ----------------------------------------------------------------------------
+# usati solo se nel calendario Garmin Connect non c'è una gara futura
 RACE_DATE = date(2026, 11, 8)
 RACE_NAME = "10 km"
+RACE_KM = 10
 
 ATHLETE = {
     "height_cm": 182,
@@ -59,6 +62,9 @@ VO2_SAMPLE_EVERY_DAYS = 5
 ACTIVITY_TABLE_WEEKS = 4
 SPARKLINE_DAYS = 30
 TIMESERIES_MAX_POINTS = 250
+CALENDAR_WEEKS_BACK = 11      # + la settimana in corso = 12 settimane di storico
+CALENDAR_WEEKS_AHEAD_MAX = 16  # oltre non mostro settimane vuote fino a una gara lontana
+RACE_LOOKAHEAD_MONTHS = 12
 
 RUNNING_TYPE_KEYS = {
     "running", "track_running", "trail_running", "treadmill_running",
@@ -248,6 +254,19 @@ def is_pace_sport(a):
     return activity_type_key(a) in RUNNING_TYPE_KEYS or activity_type_key(a) in {"walking", "hiking"}
 
 
+def sport_group(a):
+    key = activity_type_key(a)
+    if key in RUNNING_TYPE_KEYS:
+        return "run"
+    if "cycl" in key or "biking" in key:
+        return "bike"
+    if "swim" in key:
+        return "swim"
+    if key in {"strength_training", "fitness_equipment"}:
+        return "strength"
+    return "other"
+
+
 def is_running(a):
     return activity_type_key(a) in RUNNING_TYPE_KEYS
 
@@ -341,6 +360,89 @@ def fetch_vo2max(client, since_days, every_days):
 # ----------------------------------------------------------------------------
 # FETCH — dettaglio per singola attività (dati grezzi + serie temporali)
 # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# FETCH — profilo, record, previsioni Garmin e gare (scheda "Io" e calendario)
+# ----------------------------------------------------------------------------
+
+PR_LABELS = {1: "1 km", 2: "1 miglio", 3: "5 km", 4: "10 km", 5: "Mezza maratona", 6: "Maratona", 7: "Corsa più lunga"}
+PREDICTION_KEYS = {"5": "time5K", "10": "time10K", "21.0975": "timeHalfMarathon", "42.195": "timeMarathon"}
+
+
+def fetch_profile(client):
+    data = (safe(client.get_user_profile) or {}).get("userData") or {}
+    age = None
+    try:
+        born = date.fromisoformat(data["birthDate"])
+        today = date.today()
+        age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    except Exception:
+        pass
+    records = []
+    for r in sorted(safe(client.get_personal_record) or [], key=lambda r: r.get("typeId") or 0):
+        label, value = PR_LABELS.get(r.get("typeId")), r.get("value")
+        if not label or not value:
+            continue
+        when = (r.get("actStartDateTimeInGMTFormatted") or "")[:10]
+        is_distance = r["typeId"] == 7  # "corsa più lunga" è in metri, gli altri in secondi
+        records.append({
+            "label": label,
+            "value": f"{value / 1000:.2f} km" if is_distance else sec_to_hms(value),
+            "seconds": None if is_distance else value,
+            "date": f"{fmt_day(when)}/{when[:4]}" if when else "",
+            "activity": r.get("activityName") or "",
+        })
+    return {
+        "name": safe(client.get_full_name) or "",
+        "age": age,
+        "height_cm": round(data["height"]) if data.get("height") else ATHLETE["height_cm"],
+        "weight_kg": round(data["weight"] / 1000, 1) if data.get("weight") else ATHLETE["weight_kg"],
+        "vo2max": data.get("vo2MaxRunning"),
+        "lt_hr": data.get("lactateThresholdHeartRate"),
+        "records": records,
+    }
+
+
+def fetch_race_predictions(client):
+    raw = safe(client.get_race_predictions) or {}
+    if isinstance(raw, list):
+        raw = raw[-1] if raw else {}
+    return {km: raw[key] for km, key in PREDICTION_KEYS.items() if raw.get(key)}
+
+
+def fetch_races(client, first_day, months_ahead):
+    """Eventi del calendario Garmin Connect (gare comprese) dal mese di first_day in avanti."""
+    events = {}
+    y, m = first_day.year, first_day.month
+    last = date.today() + timedelta(days=31 * months_ahead)
+    while (y, m) <= (last.year, last.month):
+        cal = safe(client.connectapi, f"/calendar-service/year/{y}/month/{m - 1}") or {}
+        for it in cal.get("calendarItems") or []:
+            if it.get("itemType") != "event" or not it.get("date"):
+                continue
+            target = it.get("completionTarget") or {}
+            km = target.get("value") if target.get("unitType") == "distance" else None
+            if km and target.get("unit") == "meter":
+                km /= 1000
+            elif km and target.get("unit") == "mile":
+                km *= 1.609344
+            events[it.get("id") or it["date"]] = {
+                "date": it["date"], "name": it.get("title") or "Gara", "km": round(km, 4) if km else None,
+                "primary": bool(it.get("primaryEvent")), "race": bool(it.get("isRace")),
+            }
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return sorted(events.values(), key=lambda e: e["date"])
+
+
+def pick_goal(races):
+    """La gara principale futura di Garmin; altrimenti la prima gara futura; altrimenti la configurazione."""
+    today = date.today().isoformat()
+    future = [r for r in races if r["date"] >= today and r["race"]]
+    goal = next((r for r in future if r["primary"]), None) or (future[0] if future else None)
+    if goal:
+        return {"date": goal["date"], "name": goal["name"], "km": goal["km"]}
+    return {"date": RACE_DATE.isoformat(), "name": RACE_NAME, "km": RACE_KM}
+
 
 def find_metric_index(key_to_idx, *substrings):
     for k, idx in key_to_idx.items():
@@ -650,27 +752,57 @@ def build_week_row(running_activities, pb_5k_pace_sec_km):
     return result
 
 
-def compute_insights(load_series, mileage, vo2_series, days_left):
-    insights = []
-    taper = 0 < days_left <= 21
-    if load_series:
-        tsb = load_series[-1]["tsb"]
-        if tsb < -15 and taper:
-            insights.append({"color": "danger", "title": f"Stanco a {days_left} giorni dalla gara",
-                              "text": f"Freschezza a {tsb}: è il momento di scaricare. Riduci il volume del 20-30% a settimana e tieni una sola seduta breve a ritmo gara: la freschezza risalirà in tempo per il {RACE_DATE.strftime('%d/%m')}."})
-        elif tsb < -15:
-            insights.append({"color": "danger", "title": "Fatica alta",
-                              "text": f"Freschezza a {tsb}: la fatica è parecchio sopra la forma fisica. Meglio 2-3 giorni facili prima della prossima sessione di qualità."})
-        elif taper:
-            insights.append({"color": "good" if tsb > -5 else "info", "title": f"Scarico pre-gara: {days_left} giorni",
-                              "text": f"Freschezza a {tsb}. Nelle ultime settimane riduci il volume e mantieni un po' di ritmo gara: l'obiettivo è arrivare al via con la freschezza sopra 0."})
-        elif tsb > 5:
-            insights.append({"color": "good", "title": "Sei fresco",
-                              "text": f"Freschezza a +{tsb}: buon momento per una sessione impegnativa o per testarti in gara."})
-        else:
-            insights.append({"color": "info", "title": "Equilibrio ok",
-                              "text": f"Freschezza a {tsb}: forma fisica e fatica sono bilanciate, puoi proseguire il piano come previsto."})
+def build_calendar(activities, load_series, races, pb_5k_pace_sec_km, detail_ids, until):
+    """Settimane lun-dom per la scheda Calendario: attività di ogni giorno e riepilogo della settimana."""
+    today = date.today()
+    start = today - timedelta(days=today.weekday(), weeks=CALENDAR_WEEKS_BACK)
+    end = min(max(today, until), today + timedelta(weeks=CALENDAR_WEEKS_AHEAD_MAX))
+    end += timedelta(days=6 - end.weekday())
+    by_day = {}
+    for a in activities:
+        try:
+            dt = datetime.strptime(a.get("startTimeLocal"), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        dist_km = (a.get("distance") or 0) / 1000.0
+        dur_s = a.get("duration") or 0
+        by_day.setdefault(dt.date(), []).append({
+            "id": str(a.get("activityId")), "time": dt.strftime("%H:%M"),
+            "name": a.get("activityName") or sport_label(a), "sport": sport_label(a), "group": sport_group(a),
+            "dur": round(dur_s), "km": round(dist_km, 2) if dist_km else None,
+            "pace": sec_to_pace_str(dur_s / dist_km) if is_pace_sport(a) and dist_km else None,
+            "hr": round(a["averageHR"]) if a.get("averageHR") else None,
+            "load": round(estimate_load(a)),
+            "kind": classify_effort(a, pb_5k_pace_sec_km) if is_pace_sport(a) else None,
+            "detail": str(a.get("activityId")) in detail_ids,
+        })
+    load_by_day = {p["date"]: p for p in load_series}
+    weeks = []
+    monday = start
+    while monday <= end:
+        days = [monday + timedelta(days=i) for i in range(7)]
+        acts = [sorted(by_day.get(d, []), key=lambda x: x["time"]) for d in days]
+        flat = [x for day in acts for x in day]
+        form = load_by_day.get(min(days[-1], today).isoformat()) if monday <= today else None
+        weeks.append({
+            "days": [{"date": d.isoformat(), "acts": day} for d, day in zip(days, acts)],
+            "dur": sum(x["dur"] for x in flat),
+            "km": round(sum(x["km"] or 0 for x in flat), 1),
+            "run_km": round(sum(x["km"] or 0 for x in flat if x["group"] == "run"), 1),
+            "load": sum(x["load"] for x in flat),
+            "ctl": form["ctl"] if form else None,
+            "atl": form["atl"] if form else None,
+            "tsb": form["tsb"] if form else None,
+        })
+        monday += timedelta(weeks=1)
+    first, last = start.isoformat(), end.isoformat()
+    return {"weeks": weeks, "races": [r for r in races if first <= r["date"] <= last]}
 
+
+def compute_insights(mileage, vo2_series):
+    """Consigli che non dipendono dalla gara. Quello sulla freschezza lo calcola la pagina,
+    perché cambia se si cambia obiettivo dalla scheda Io."""
+    insights = []
     # la settimana in corso è incompleta fino a domenica: confronto le ultime due complete
     values = mileage.get("values") or []
     if date.today().weekday() < 6:
@@ -704,10 +836,6 @@ def compute_insights(load_series, mileage, vo2_series, days_left):
     order = {"danger": 0, "warn": 1, "info": 2, "good": 3}
     insights.sort(key=lambda i: order[i["color"]])
     return insights
-
-
-def predict_10k_from_5k(pb_5k_sec):
-    return pb_5k_sec * (10.0 / 5.0) ** 1.06
 
 
 def build_activity_summary(a):
@@ -758,8 +886,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="it">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dashboard allenamento · {race_name}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Dashboard allenamento · {page_title}</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%234fd1c5'/%3E%3C/svg%3E">
 <script>
 {chartjs_source}
@@ -778,6 +906,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     --good: #68d391;
     --info: #63b3ed;
     --hrv: #b794f4;
+    --tabbar-h: 64px;
     color-scheme: dark;
   }}
   * {{ box-sizing: border-box; }}
@@ -837,6 +966,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .tabbtn:hover {{ color: var(--text); }}
   .tabbtn[aria-selected="true"] {{ color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }}
 
+  .tabbtn svg {{ display: none; }}
+
   .section {{ display: none; }}
   .section.active {{ display: block; }}
 
@@ -894,6 +1025,74 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .mini-stat-row .ms {{ font-size: 12px; color: var(--muted); }}
   .mini-stat-row .ms strong {{ display: block; font-size: 15px; color: var(--text); font-weight: 700; }}
 
+  /* ---------- scheda Io ---------- */
+  .me-stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }}
+  .me-stats .dstat {{ background: var(--panel-hover); border-radius: 10px; padding: 10px; }}
+  .me-stats .dstat .v {{ font-size: 18px; font-weight: 700; }}
+  .me-stats .dstat .l {{ font-size: 12px; color: var(--muted); }}
+  .goal-form {{ display: grid; gap: 12px; }}
+  .goal-form label {{ display: grid; gap: 4px; font-size: 12px; color: var(--muted); }}
+  .goal-form label[hidden] {{ display: none; }}
+  .goal-form input, .goal-form select {{ background: var(--panel-hover); border: 1px solid var(--panel-border); color: var(--text); border-radius: 8px; padding: 10px; font: inherit; font-size: 15px; min-height: 44px; width: 100%; }}
+  .goal-form input:focus, .goal-form select:focus {{ border-color: var(--accent); outline: none; }}
+  .form-btns {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+  .btn-primary, .btn-ghost {{ border-radius: 8px; padding: 10px 16px; font: inherit; font-weight: 600; cursor: pointer; min-height: 44px; }}
+  .btn-primary {{ background: var(--accent); color: var(--bg); border: 1px solid var(--accent); }}
+  .btn-ghost {{ background: transparent; color: var(--text); border: 1px solid var(--panel-border); }}
+  .form-note {{ margin: 0; font-size: 12px; color: var(--muted); min-height: 1.4em; }}
+
+  /* ---------- scheda Calendario ---------- */
+  .cal-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }}
+  .cal-head h2 {{ margin: 0; font-size: 18px; }}
+  .cal-weekdays, .cal-week {{ display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)) minmax(140px, 1.1fr); gap: 1px; }}
+  .cal-weekdays {{ position: sticky; top: 0; z-index: 4; background: var(--bg); font-size: 12px; color: var(--muted); padding: 6px 0; }}
+  .cal-weekdays span {{ padding-left: 8px; }}
+  .calendar {{ display: grid; gap: 1px; background: var(--panel-border); border: 1px solid var(--panel-border); border-radius: 12px; overflow: hidden; }}
+  .cal-month {{ background: var(--bg); padding: 14px 8px 6px; font-weight: 700; font-size: 15px; text-transform: capitalize; }}
+  .cal-day, .cal-sum {{ background: var(--panel); min-height: 116px; padding: 6px; display: flex; flex-direction: column; gap: 5px; min-width: 0; }}
+  .cal-day.today {{ box-shadow: inset 0 0 0 2px var(--accent); }}
+  .cal-date {{ font-size: 12px; color: var(--muted); }}
+  .cal-date .wd {{ display: none; }}
+  .cal-day.today .cal-date {{ color: var(--accent); font-weight: 700; }}
+  .cal-items {{ display: flex; flex-direction: column; gap: 5px; min-width: 0; }}
+  .cal-card {{ --c: var(--muted); display: block; width: 100%; text-align: left; background: var(--panel-hover); border: 1px solid var(--panel-border); border-left: 3px solid var(--c); border-radius: 8px; padding: 6px 7px; color: var(--text); font: inherit; font-size: 12px; line-height: 1.3; }}
+  button.cal-card {{ cursor: pointer; }}
+  button.cal-card:hover {{ border-color: var(--c); }}
+  .cal-card.run {{ --c: var(--accent); }}
+  .cal-card.bike {{ --c: var(--info); }}
+  .cal-card.swim {{ --c: var(--hrv); }}
+  .cal-card.strength {{ --c: var(--accent2); }}
+  .cal-card.race {{ --c: var(--danger); background: color-mix(in srgb, var(--danger) 12%, var(--panel)); }}
+  .cal-card .t {{ font-weight: 600; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }}
+  .cal-card .s {{ color: var(--muted); font-size: 11px; margin-top: 2px; }}
+  .cal-card .s b {{ color: var(--text); font-weight: 600; }}
+  .cal-sum {{ background: var(--panel-hover); font-size: 12px; gap: 3px; }}
+  .cal-sum h4 {{ margin: 0 0 2px; font-size: 12px; color: var(--muted); font-weight: 600; }}
+  .cal-sum .row {{ display: flex; justify-content: space-between; gap: 6px; color: var(--muted); }}
+  .cal-sum .row b {{ color: var(--text); font-weight: 600; }}
+
+  @media (max-width: 899px) {{
+    .cal-weekdays {{ display: none; }}
+    .cal-week {{ grid-template-columns: 1fr; }}
+    .cal-sum {{ order: -1; min-height: 0; flex-direction: row; flex-wrap: wrap; gap: 2px 14px; }}
+    .cal-sum h4 {{ width: 100%; }}
+    .cal-sum .row {{ gap: 4px; }}
+    .cal-day {{ min-height: 0; flex-direction: row; align-items: flex-start; gap: 10px; padding: 8px; }}
+    .cal-date {{ flex: 0 0 48px; padding-top: 2px; }}
+    .cal-date .wd {{ display: block; }}
+    .cal-items {{ flex: 1; }}
+    .cal-day.rest .cal-items::after {{ content: 'Riposo'; color: var(--muted); font-size: 12px; padding-top: 2px; }}
+  }}
+
+  /* ---------- telefono: schede in basso come un'app ---------- */
+  @media (max-width: 767px) {{
+    body {{ padding-bottom: calc(var(--tabbar-h) + 24px + env(safe-area-inset-bottom)); }}
+    .tabs {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; margin: 0; gap: 0; border-bottom: none; border-top: 1px solid var(--panel-border); background: color-mix(in srgb, var(--bg) 88%, transparent); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); padding: 4px 4px env(safe-area-inset-bottom); }}
+    .tabbtn {{ flex: 1; min-width: 0; min-height: var(--tabbar-h); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 4px 2px; font-size: 11px; border-bottom: none; margin: 0; -webkit-tap-highlight-color: transparent; }}
+    .tabbtn svg {{ display: block; width: 23px; height: 23px; }}
+    .tabbtn[aria-selected="true"] {{ font-weight: 600; }}
+  }}
+
   @media (prefers-reduced-motion: reduce) {{
     .modal-overlay, .modal-box {{ transition: none; }}
   }}
@@ -907,7 +1106,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .stat-card {{ flex: 0 0 150px; scroll-snap-align: start; }}
     .week-row {{ gap: 4px; }}
     .panel {{ padding: 16px; }}
-    .tabbtn {{ padding: 10px 12px; }}
     .hide-sm {{ display: none; }}
     th, td {{ padding: 8px 6px; }}
     .modal-box {{ width: calc(100% - 20px); padding: 16px; }}
@@ -918,12 +1116,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="container">
 
+  <div id="summary">
   <div class="top-grid">
     <div class="hero">
-      <h1>Gara {race_name} · {race_date_str}</h1>
-      <div class="num">{days_left}</div>
-      <div class="sub">giorni alla gara · {weeks_left} settimane</div>
-      <div class="predict">Stima sui 10 km: <strong>{predicted_10k}</strong> ({predicted_pace}), calcolata dal tuo PB sui 5 km</div>
+      <h1 id="goalTitle"></h1>
+      <div class="num" id="goalDays"></div>
+      <div class="sub" id="goalSub"></div>
+      <div class="predict" id="goalPredict"></div>
     </div>
     <div class="stat-cards">
       <div class="stat-card"><div class="l">Forma fisica <abbr title="Chronic Training Load">CTL</abbr></div><div class="v">{card_ctl}</div>{delta_ctl}<canvas id="sparkCtl" aria-hidden="true"></canvas></div>
@@ -934,16 +1133,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="insights">{insights_html}</div>
+  <div class="insights" id="insights">{insights_html}</div>
 
   <div class="week-row" aria-label="Questa settimana">{week_row_html}</div>
   <div class="legend" aria-hidden="true"><span class="easy">Facile</span><span class="workout">Allenamento</span><span class="rest">Riposo</span></div>
-
-  <div class="tabs" role="tablist">
-    <button class="tabbtn" role="tab" id="tab-fitness" aria-controls="section-fitness" aria-selected="true" onclick="showSection('fitness', this)">Forma</button>
-    <button class="tabbtn" role="tab" id="tab-recovery" aria-controls="section-recovery" aria-selected="false" tabindex="-1" onclick="showSection('recovery', this)">Recupero</button>
-    <button class="tabbtn" role="tab" id="tab-runs" aria-controls="section-runs" aria-selected="false" tabindex="-1" onclick="showSection('runs', this)">Allenamenti</button>
   </div>
+
+  <nav class="tabs" role="tablist" aria-label="Sezioni">
+    <button class="tabbtn" role="tab" id="tab-fitness" aria-controls="section-fitness" aria-selected="true" onclick="showSection('fitness', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/></svg>Forma</button>
+    <button class="tabbtn" role="tab" id="tab-recovery" aria-controls="section-recovery" aria-selected="false" tabindex="-1" onclick="showSection('recovery', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/></svg>Recupero</button>
+    <button class="tabbtn" role="tab" id="tab-runs" aria-controls="section-runs" aria-selected="false" tabindex="-1" onclick="showSection('runs', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>Allenamenti</button>
+    <button class="tabbtn" role="tab" id="tab-calendar" aria-controls="section-calendar" aria-selected="false" tabindex="-1" onclick="showSection('calendar', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>Calendario</button>
+    <button class="tabbtn" role="tab" id="tab-me" aria-controls="section-me" aria-selected="false" tabindex="-1" onclick="showSection('me', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/></svg>Io</button>
+  </nav>
 
   <div class="section active" id="section-fitness" role="tabpanel" aria-labelledby="tab-fitness">
     <div class="grid three">
@@ -970,6 +1172,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <h2>Allenamenti recenti</h2>
       <div class="desc">Ultime {table_weeks} settimane, tutti gli sport. Clicca una riga (o premi Invio) per il dettaglio.</div>
       {table_or_missing}
+    </div>
+  </div>
+
+  <div class="section" id="section-calendar" role="tabpanel" aria-labelledby="tab-calendar">
+    <div class="cal-head">
+      <h2>Calendario</h2>
+      <button type="button" class="range-btn" onclick="scrollCalendarToToday(true)">Vai a oggi</button>
+    </div>
+    <div class="cal-weekdays" aria-hidden="true"><span>Lun</span><span>Mar</span><span>Mer</span><span>Gio</span><span>Ven</span><span>Sab</span><span>Dom</span><span>Settimana</span></div>
+    <div class="calendar" id="calendar"></div>
+  </div>
+
+  <div class="section" id="section-me" role="tabpanel" aria-labelledby="tab-me">
+    <div class="grid">
+      <div class="panel">
+        <h2 id="meName">Io</h2>
+        <div class="desc" id="meUpdated"></div>
+        <div class="me-stats" id="meStats"></div>
+      </div>
+      <div class="panel">
+        <h2>Obiettivo</h2>
+        <form id="goalForm" class="goal-form" onsubmit="saveGoal(event)" novalidate>
+          <label>Nome della gara<input id="goalName" type="text" maxlength="60" required autocomplete="off"></label>
+          <label>Data<input id="goalDate" type="date" required></label>
+          <label>Distanza
+            <select id="goalDist" onchange="toggleCustomDist()">
+              <option value="5">5 km</option>
+              <option value="10">10 km</option>
+              <option value="21.0975">Mezza maratona</option>
+              <option value="42.195">Maratona</option>
+              <option value="custom">Altra distanza</option>
+            </select>
+          </label>
+          <label id="goalKmWrap" hidden>Chilometri<input id="goalKm" type="number" min="1" max="250" step="0.1" inputmode="decimal"></label>
+          <label>Tempo obiettivo (facoltativo)<input id="goalTarget" type="text" placeholder="es. 54:30 oppure 1:55:00" inputmode="numeric" autocomplete="off"></label>
+          <div class="form-btns">
+            <button type="submit" class="btn-primary">Salva obiettivo</button>
+            <button type="button" class="btn-ghost" id="goalReset" onclick="resetGoal()">Usa la gara di Garmin</button>
+          </div>
+          <p class="form-note" id="goalNote" role="status"></p>
+        </form>
+      </div>
+      <div class="panel">
+        <h2>Previsioni Garmin</h2>
+        <div class="desc">I tempi che il tuo Garmin stima oggi per ogni distanza.</div>
+        <div id="mePredictions"></div>
+      </div>
+      <div class="panel">
+        <h2>Record personali</h2>
+        <div id="meRecords"></div>
+      </div>
     </div>
   </div>
 
@@ -1088,6 +1341,10 @@ function showSection(name, btn) {{
     b.setAttribute('aria-selected', on ? 'true' : 'false');
     b.tabIndex = on ? 0 : -1;
   }});
+  // calendario e profilo hanno tutto lo schermo: il riepilogo in alto resta nelle altre schede
+  document.getElementById('summary').hidden = name === 'calendar' || name === 'me';
+  if (window.matchMedia('(max-width: 767px)').matches) window.scrollTo(0, 0);
+  if (name === 'calendar') scrollCalendarToToday(false);
 }}
 
 /* ---------- finestre: focus, Esc, tastiera ---------- */
@@ -1141,6 +1398,264 @@ try {{
     }}
   }});
 }} catch (e) {{ console.error('Errore data di oggi', e); }}
+
+/* ---------- obiettivo, scheda Io e calendario ---------- */
+const PROFILE = {profile_json};
+const PREDICTIONS = {predictions_json};
+const GARMIN_GOAL = {goal_json};
+const CALENDAR = {calendar_json};
+const TSB_NOW = {tsb_now};
+const GENERATED_STAMP = '{generated_stamp}';
+const GENERATED_LABEL = '{generated_label}';
+const GOAL_KEY = 'corsa-obiettivo';
+const WEEKDAYS = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom'];
+const MONTHS = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
+
+function esc(v) {{
+  return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, c => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[c]);
+}}
+function localIso(d) {{
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}}
+function fmtDate(iso) {{ return iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(0, 4); }}
+function fmtDur(sec) {{
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+}}
+function parseTime(txt) {{
+  const parts = txt.trim().split(':').map(Number);
+  if (parts.length < 2 || parts.length > 3 || parts.some(n => !Number.isFinite(n) || n < 0)) return null;
+  const sec = parts.reduce((acc, n) => acc * 60 + n, 0);
+  return sec > 0 ? sec : null;
+}}
+function fmtKm(km) {{
+  if (Math.abs(km - 21.0975) < 0.01) return 'mezza maratona';
+  if (Math.abs(km - 42.195) < 0.01) return 'maratona';
+  return Math.round(km * 10) / 10 + ' km';
+}}
+function daysUntil(iso) {{
+  const [y, m, d] = iso.split('-').map(Number);
+  const t = new Date();
+  return Math.round((new Date(y, m - 1, d) - new Date(t.getFullYear(), t.getMonth(), t.getDate())) / 86400000);
+}}
+
+function loadGoal() {{
+  try {{
+    const g = JSON.parse(localStorage.getItem(GOAL_KEY));
+    if (g && g.name && g.date && g.km > 0) return Object.assign({{}}, g, {{ custom: true }});
+  }} catch (e) {{}}
+  return Object.assign({{}}, GARMIN_GOAL, {{ custom: false }});
+}}
+let GOAL = loadGoal();
+
+function predictFor(km) {{
+  // Garmin stima 5 km, 10 km, mezza e maratona: per le altre distanze scalo dalla stima più vicina (Riegel)
+  const dists = Object.keys(PREDICTIONS);
+  if (!dists.length || !(km > 0)) return null;
+  const near = dists.reduce((a, b) => Math.abs(Math.log(Number(b) / km)) < Math.abs(Math.log(Number(a) / km)) ? b : a);
+  const exact = Math.abs(Number(near) - km) < 0.01;
+  return {{ sec: exact ? PREDICTIONS[near] : PREDICTIONS[near] * Math.pow(km / Number(near), 1.06), exact }};
+}}
+
+function renderGoal() {{
+  const g = GOAL, days = daysUntil(g.date);
+  document.title = 'Dashboard allenamento · ' + g.name;
+  document.getElementById('goalTitle').textContent = g.name + ' · ' + fmtDate(g.date);
+  document.getElementById('goalDays').textContent = days >= 0 ? days : '—';
+  document.getElementById('goalSub').textContent = days > 0 ? 'giorni alla gara · ' + (days / 7).toFixed(1) + ' settimane'
+    : days === 0 ? 'La gara è oggi: in bocca al lupo!' : 'Gara passata: scegli il prossimo obiettivo nella scheda Io.';
+  const p = predictFor(g.km);
+  const label = fmtKm(g.km);
+  let txt = p ? 'Stima Garmin ' + (label.endsWith('maratona') ? 'sulla ' : 'sui ') + label + ': <strong>' + fmtDur(p.sec) + '</strong> (' + fmtPace(p.sec / g.km) + '/km)'
+    + (p.exact ? '' : ', ricavata dalla previsione Garmin più vicina') : 'Garmin non ha ancora una stima per questa distanza.';
+  if (g.target) txt += '<br>Il tuo obiettivo: <strong>' + fmtDur(g.target) + '</strong> (' + fmtPace(g.target / g.km) + '/km)';
+  document.getElementById('goalPredict').innerHTML = txt;
+}}
+
+function renderInsights() {{
+  const box = document.getElementById('insights');
+  box.querySelectorAll('.insight.tsb').forEach(e => e.remove());
+  if (TSB_NOW !== null) {{
+    const tsb = TSB_NOW, days = daysUntil(GOAL.date), taper = days > 0 && days <= 21;
+    let c, t, p;
+    if (tsb < -15 && taper) {{
+      c = 'danger'; t = 'Stanco a ' + days + ' giorni dalla gara';
+      p = 'Freschezza a ' + tsb + ': è il momento di scaricare. Riduci il volume del 20-30% a settimana e tieni una sola seduta breve a ritmo gara: la freschezza risalirà in tempo per il ' + fmtDate(GOAL.date).slice(0, 5) + '.';
+    }} else if (tsb < -15) {{
+      c = 'danger'; t = 'Fatica alta';
+      p = 'Freschezza a ' + tsb + ': la fatica è parecchio sopra la forma fisica. Meglio 2-3 giorni facili prima della prossima sessione di qualità.';
+    }} else if (taper) {{
+      c = tsb > -5 ? 'good' : 'info'; t = 'Scarico pre-gara: ' + days + ' giorni';
+      p = "Freschezza a " + tsb + ". Nelle ultime settimane riduci il volume e mantieni un po' di ritmo gara: l'obiettivo è arrivare al via con la freschezza sopra 0.";
+    }} else if (tsb > 5) {{
+      c = 'good'; t = 'Sei fresco';
+      p = 'Freschezza a +' + tsb + ': buon momento per una sessione impegnativa o per testarti in gara.';
+    }} else {{
+      c = 'info'; t = 'Equilibrio ok';
+      p = 'Freschezza a ' + tsb + ': forma fisica e fatica sono bilanciate, puoi proseguire il piano come previsto.';
+    }}
+    const el = document.createElement('div');
+    el.className = 'insight tsb ' + c;
+    el.innerHTML = '<h2></h2><p></p>';
+    el.firstChild.textContent = t;
+    el.lastChild.textContent = p;
+    box.appendChild(el);
+  }}
+  // il consiglio più urgente per primo: è quello che la pagina mette in evidenza
+  const order = ['danger', 'warn', 'info', 'good'];
+  const rank = el => order.findIndex(c => el.classList.contains(c));
+  [...box.children].sort((a, b) => rank(a) - rank(b)).forEach(el => box.appendChild(el));
+}}
+
+function renderMe() {{
+  const P = PROFILE;
+  document.getElementById('meName').textContent = P.name || 'Io';
+  document.getElementById('meUpdated').textContent = 'Dati Garmin aggiornati il ' + GENERATED_LABEL + '.';
+  const stats = [
+    ['Età', P.age ? P.age + ' anni' : null], ['Altezza', P.height_cm ? P.height_cm + ' cm' : null],
+    ['Peso', P.weight_kg ? P.weight_kg + ' kg' : null], ['VO2 max', P.vo2max],
+    ['FC a riposo', P.rhr ? P.rhr + ' bpm' : null], ['FC di soglia', P.lt_hr ? P.lt_hr + ' bpm' : null],
+  ].filter(s => s[1]);
+  document.getElementById('meStats').innerHTML = stats.map(s => '<div class="dstat"><div class="v">' + esc(s[1]) + '</div><div class="l">' + s[0] + '</div></div>').join('');
+
+  const names = {{ '5': '5 km', '10': '10 km', '21.0975': 'Mezza maratona', '42.195': 'Maratona' }};
+  const preds = Object.keys(PREDICTIONS);
+  document.getElementById('mePredictions').innerHTML = preds.length
+    ? '<table><thead><tr><th>Distanza</th><th>Tempo</th><th>Passo</th></tr></thead><tbody>' + preds.map(k =>
+        '<tr><td>' + names[k] + '</td><td>' + fmtDur(PREDICTIONS[k]) + '</td><td>' + fmtPace(PREDICTIONS[k] / Number(k)) + '/km</td></tr>').join('') + '</tbody></table>'
+    : '<div class="missing">Garmin non ha ancora previsioni per te.</div>';
+
+  document.getElementById('meRecords').innerHTML = P.records.length
+    ? '<table><thead><tr><th>Distanza</th><th>Record</th><th>Data</th><th class="hide-sm">Attività</th></tr></thead><tbody>' + P.records.map(r =>
+        '<tr><td>' + esc(r.label) + '</td><td><strong>' + esc(r.value) + '</strong></td><td>' + esc(r.date) + '</td><td class="hide-sm">' + esc(r.activity) + '</td></tr>').join('') + '</tbody></table>'
+    : '<div class="missing">Nessun record personale su Garmin.</div>';
+}}
+
+function toggleCustomDist() {{
+  const custom = document.getElementById('goalDist').value === 'custom';
+  document.getElementById('goalKmWrap').hidden = !custom;
+}}
+function fillGoalForm() {{
+  document.getElementById('goalName').value = GOAL.name;
+  document.getElementById('goalDate').value = GOAL.date;
+  const preset = ['5', '10', '21.0975', '42.195'].find(k => GOAL.km && Math.abs(Number(k) - GOAL.km) < 0.01);
+  document.getElementById('goalDist').value = preset || 'custom';
+  document.getElementById('goalKm').value = preset ? '' : (GOAL.km || '');
+  toggleCustomDist();
+  document.getElementById('goalTarget').value = GOAL.target ? fmtDur(GOAL.target) : '';
+  document.getElementById('goalReset').hidden = !GOAL.custom;
+  document.getElementById('goalNote').textContent = GOAL.custom
+    ? 'Obiettivo scelto da te, salvato solo su questo dispositivo.'
+    : 'Obiettivo preso dalla gara principale del tuo calendario Garmin Connect. Se lo cambi qui, vale solo su questo dispositivo.';
+}}
+function saveGoal(e) {{
+  e.preventDefault();
+  const note = document.getElementById('goalNote');
+  const name = document.getElementById('goalName').value.trim();
+  const dateIso = document.getElementById('goalDate').value;
+  const dist = document.getElementById('goalDist').value;
+  const km = dist === 'custom' ? parseFloat(String(document.getElementById('goalKm').value).replace(',', '.')) : Number(dist);
+  const targetTxt = document.getElementById('goalTarget').value.trim();
+  const target = targetTxt ? parseTime(targetTxt) : null;
+  if (!name) {{ note.textContent = 'Scrivi il nome della gara.'; document.getElementById('goalName').focus(); return; }}
+  if (!dateIso) {{ note.textContent = 'Scegli la data della gara.'; document.getElementById('goalDate').focus(); return; }}
+  if (!(km > 0)) {{ note.textContent = 'Scrivi quanti chilometri è lunga la gara.'; document.getElementById('goalKm').focus(); return; }}
+  if (targetTxt && !target) {{ note.textContent = 'Scrivi il tempo come 54:30 oppure 1:55:00.'; document.getElementById('goalTarget').focus(); return; }}
+  GOAL = {{ name, date: dateIso, km, target, custom: true }};
+  let saved = true;
+  try {{ localStorage.setItem(GOAL_KEY, JSON.stringify(GOAL)); }} catch (err) {{ saved = false; }}
+  refreshGoal();
+  note.textContent = saved ? 'Obiettivo salvato.' : 'Obiettivo applicato, ma questo browser non permette di salvarlo: alla prossima apertura tornerà quello di Garmin.';
+}}
+function resetGoal() {{
+  try {{ localStorage.removeItem(GOAL_KEY); }} catch (e) {{}}
+  GOAL = loadGoal();
+  refreshGoal();
+}}
+function refreshGoal() {{
+  renderGoal();
+  renderInsights();
+  renderCalendar();
+  fillGoalForm();
+}}
+
+/* calendario: settimane lun-dom con il riepilogo della settimana nell'ultima colonna */
+function actCard(a, iso) {{
+  const main = [a.dur ? '<b>' + fmtDur(a.dur) + '</b>' : '', a.km ? a.km + ' km' : '', a.pace || ''].filter(Boolean).join(' · ');
+  const kind = a.kind === 'workout' ? 'qualità' : a.kind === 'easy' ? 'facile' : '';
+  const extra = [esc(a.sport) + (kind ? ' ' + kind : ''), a.load ? 'carico ' + a.load : '', a.hr ? a.hr + ' bpm' : ''].filter(Boolean).join(' · ');
+  const inner = '<div class="t">' + esc(a.name) + '</div>' + (main ? '<div class="s">' + main + '</div>' : '') + '<div class="s">' + extra + '</div>';
+  const cls = 'cal-card ' + a.group;
+  if (!a.detail) return '<div class="' + cls + '">' + inner + '</div>';
+  return '<button type="button" class="' + cls + '" data-id="' + esc(a.id) + '" data-title="' + esc(a.name + ' · ' + fmtDate(iso)) + '" aria-label="' + esc(a.name + ', ' + fmtDate(iso) + ': apri il dettaglio') + '">' + inner + '</button>';
+}}
+function raceCard(r) {{
+  const label = r.date === GOAL.date ? 'Il tuo obiettivo' : 'Gara';
+  return '<div class="cal-card race"><div class="t">' + esc(r.name) + '</div><div class="s">' + label + (r.km ? ' · ' + fmtKm(r.km) : '') + '</div></div>';
+}}
+function weekSummary(w) {{
+  const rows = [];
+  if (w.dur) rows.push(['Tempo', fmtDur(w.dur)]);
+  if (w.run_km) rows.push(['Corsa', w.run_km + ' km']);
+  if (w.km && w.km !== w.run_km) rows.push(['Distanza totale', w.km + ' km']);
+  if (w.load) rows.push(['Carico', w.load]);
+  if (w.ctl !== null) rows.push(['Forma', w.ctl], ['Fatica', w.atl], ['Freschezza', (w.tsb > 0 ? '+' : '') + w.tsb]);
+  const body = rows.length ? rows.map(r => '<div class="row"><span>' + r[0] + '</span><b>' + r[1] + '</b></div>').join('')
+    : '<div class="row"><span>Ancora niente</span></div>';
+  return '<div class="cal-sum"><h4>Settimana</h4>' + body + '</div>';
+}}
+function renderCalendar() {{
+  const box = document.getElementById('calendar');
+  if (!CALENDAR.weeks.length) {{ box.innerHTML = '<div class="missing">Nessuna settimana da mostrare.</div>'; return; }}
+  const today = localIso(new Date());
+  const races = CALENDAR.races.slice();
+  if (!races.some(r => r.date === GOAL.date)) races.push({{ date: GOAL.date, name: GOAL.name, km: GOAL.km }});
+  let html = '';
+  CALENDAR.weeks.forEach((w, wi) => {{
+    const first = w.days.find(d => d.date.endsWith('-01')) || (wi === 0 ? w.days[0] : null);
+    if (first) html += '<div class="cal-month">' + MONTHS[Number(first.date.slice(5, 7)) - 1] + ' ' + first.date.slice(0, 4) + '</div>';
+    html += '<div class="cal-week">';
+    w.days.forEach((d, i) => {{
+      const dayRaces = races.filter(r => r.date === d.date);
+      const cls = ['cal-day'];
+      if (d.date === today) cls.push('today');
+      else if (d.date < today && !d.acts.length && !dayRaces.length) cls.push('rest');
+      html += '<div class="' + cls.join(' ') + '"' + (d.date === today ? ' aria-current="date"' : '') + '>'
+        + '<div class="cal-date"><span class="wd">' + WEEKDAYS[i] + '</span>' + Number(d.date.slice(8, 10)) + '</div>'
+        + '<div class="cal-items">' + dayRaces.map(raceCard).join('') + d.acts.map(a => actCard(a, d.date)).join('') + '</div></div>';
+    }});
+    html += weekSummary(w) + '</div>';
+  }});
+  box.innerHTML = html;
+}}
+function scrollCalendarToToday(smooth) {{
+  const t = document.querySelector('.cal-day.today');
+  if (t) t.scrollIntoView({{ block: 'center', behavior: smooth ? 'smooth' : 'auto' }});
+}}
+document.getElementById('calendar').addEventListener('click', e => {{
+  const b = e.target.closest('button.cal-card');
+  if (b) openDetail(b.dataset.id, b.dataset.title);
+}});
+
+try {{ renderGoal(); }} catch (e) {{ console.error('Errore obiettivo', e); }}
+try {{ renderInsights(); }} catch (e) {{ console.error('Errore consigli', e); }}
+try {{ renderMe(); fillGoalForm(); }} catch (e) {{ console.error('Errore scheda Io', e); }}
+try {{ renderCalendar(); }} catch (e) {{ console.error('Errore calendario', e); }}
+
+/* ---------- pagina sempre aggiornata: se online c'è una versione più nuova, si ricarica ---------- */
+async function checkNewVersion() {{
+  if (location.protocol === 'file:') return;
+  try {{
+    const r = await fetch('version.txt?t=' + Date.now(), {{ cache: 'no-store' }});
+    if (!r.ok) return;
+    const v = (await r.text()).trim();
+    // il ?v= nuovo evita che il telefono riprenda la pagina vecchia dalla sua cache
+    if (/^[0-9]{{12}}$/.test(v) && v > GENERATED_STAMP) location.replace(location.pathname + '?v=' + v);
+  }} catch (e) {{}}
+}}
+checkNewVersion();
+document.addEventListener('visibilitychange', () => {{ if (document.visibilityState === 'visible') checkNewVersion(); }});
 
 /* ---------- grafico ingrandito con selettore Oggi/Settimana/Mese/Tutto ---------- */
 function openEnlarge(id) {{
@@ -1433,25 +1948,32 @@ def main():
     rhr_series, sleep_series, hrv_series = fetch_daily_wellness(client, RECOVERY_LOOKBACK_DAYS)
     vo2_series = fetch_vo2max(client, WEEKS_TREND * 7, VO2_SAMPLE_EVERY_DAYS)
 
+    print("  -> Scarico profilo, record, previsioni e gare in calendario...")
+    profile = fetch_profile(client)
+    profile["rhr"] = rhr_series[-1]["value"] if rhr_series else None
+    if vo2_series:
+        profile["vo2max"] = vo2_series[-1]["value"]
+    predictions = fetch_race_predictions(client)
+    races = fetch_races(client, date.today() - timedelta(weeks=CALENDAR_WEEKS_BACK + 1), RACE_LOOKAHEAD_MONTHS)
+    goal = pick_goal(races)
+
     load_series = compute_ctl_atl_tsb(activities, LOAD_LOOKBACK_DAYS)
     load_series_display = load_series[-WEEKS_TREND * 7:]
 
     mileage = compute_weekly_mileage(running_activities, WEEKS_TREND)
 
-    pb_5k_pace_sec_km = ATHLETE["pb_5k_sec"] / 5.0
+    pb_5k_sec = next((r["seconds"] for r in profile["records"] if r["label"] == "5 km"), ATHLETE["pb_5k_sec"])
+    pb_5k_pace_sec_km = pb_5k_sec / 5.0
     recent_rows = build_recent_table(activities, ACTIVITY_TABLE_WEEKS, pb_5k_pace_sec_km)
     week_row = build_week_row(running_activities, pb_5k_pace_sec_km)
 
     today = date.today()
-    days_left = (RACE_DATE - today).days
-    weeks_left = round(days_left / 7, 1)
-    predicted_sec = predict_10k_from_5k(ATHLETE["pb_5k_sec"])
-    predicted_10k = sec_to_mmss(predicted_sec)
-    insights = compute_insights(load_series, mileage, vo2_series, days_left)
+    insights = compute_insights(mileage, vo2_series)
 
     recent_activities_raw = [a for a in activities if str(a.get("activityId")) in {r["activity_id"] for r in recent_rows}]
     activity_details, activity_timeseries = fetch_activity_details(client, recent_activities_raw)
     activity_summary = {str(a.get("activityId")): build_activity_summary(activity_details.get(str(a.get("activityId")), a)) for a in recent_activities_raw}
+    calendar = build_calendar(activities, load_series, races, pb_5k_pace_sec_km, set(activity_summary), date.fromisoformat(goal["date"]))
 
     card_ctl = f"{load_series[-1]['ctl']}" if load_series else "—"
     card_atl = f"{load_series[-1]['atl']}" if load_series else "—"
@@ -1568,7 +2090,7 @@ new Chart(document.getElementById('sleepChart'), {{
     else:
         table_html = None
 
-    if insights:
+    if insights or load_series:
         insights_html = "\n".join(f'<div class="insight {i["color"]}"><h2>{i["title"]}</h2><p>{i["text"]}</p></div>' for i in insights)
     else:
         insights_html = '<div class="insight info"><h2>Dati insufficienti</h2><p>Servono più allenamenti registrati per generare consigli automatici.</p></div>'
@@ -1586,12 +2108,18 @@ new Chart(document.getElementById('sleepChart'), {{
     def last(series, key="value"):
         return series[-1][key] if series else "—"
 
+    now = datetime.now()
+    generated_stamp = now.strftime("%Y%m%d%H%M")
     ctx = {
-        "race_name": RACE_NAME, "race_date_str": RACE_DATE.strftime("%d/%m/%Y"),
-        "generated_at": datetime.now().strftime("%d/%m/%Y alle %H:%M"),
+        "page_title": escape(goal["name"]),
         "generated_iso": today.isoformat(),
-        "days_left": days_left, "weeks_left": weeks_left, "predicted_10k": predicted_10k,
-        "predicted_pace": sec_to_pace_str(predicted_sec / 10.0),
+        "generated_stamp": generated_stamp,
+        "generated_label": now.strftime("%d/%m alle %H:%M"),
+        "tsb_now": json.dumps(load_series[-1]["tsb"] if load_series else None),
+        "profile_json": json_for_script(profile),
+        "predictions_json": json_for_script(predictions),
+        "goal_json": json_for_script(goal),
+        "calendar_json": json_for_script(calendar),
         "weeks_trend": WEEKS_TREND, "recovery_weeks": RECOVERY_LOOKBACK_DAYS // 7, "table_weeks": ACTIVITY_TABLE_WEEKS,
         "card_ctl": card_ctl, "card_atl": card_atl, "card_vo2": card_vo2, "card_rhr": card_rhr, "card_hrv": card_hrv,
         "delta_ctl": delta_html(delta_7d(load_series, "ctl"), True),
@@ -1618,6 +2146,9 @@ new Chart(document.getElementById('sleepChart'), {{
     html = HTML_TEMPLATE.format(**ctx)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
+    # la pagina online lo legge all'apertura: se è più nuovo di lei, si ricarica da sola
+    with open(os.path.join(os.path.dirname(OUTPUT_HTML), "version.txt"), "w", encoding="utf-8") as f:
+        f.write(generated_stamp)
 
     print(f"\n✅ Fatto. Pagina generata in: {OUTPUT_HTML}")
     print("   Apri il file nel browser (doppio click).")

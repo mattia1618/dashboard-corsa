@@ -74,6 +74,7 @@ def main():
                     f.write(re.sub(r"</head>", PWA_TAGS + "</head>", html, count=1))
                 for name in ("manifest.json", "icon.png"):
                     shutil.copy(os.path.join(DIR, "app", name), site)
+                shutil.copy(os.path.join(DIR, "version.txt"), site)  # la pagina lo controlla per ricaricarsi
 
                 # ramo gh-pages "usa e getta": ogni volta un solo commit, niente storico che cresce
                 git = ["git", "-C", site, "-c", "user.name=Mattia", "-c", "user.email=mattia.spazzatura05@gmail.com"]
