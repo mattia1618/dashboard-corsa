@@ -19,7 +19,7 @@ def run(day, km, name="Corsa"):
 def test_calendar_weeks():
     gym = {"activityId": 1, "activityName": "Pesi", "startTimeLocal": f"{last_sunday} 10:00:00",
            "distance": 0, "duration": 2700, "activityType": {"typeKey": "strength_training"}}
-    cal = d.build_calendar([run(last_sunday, 10), gym], [], [], 330, set(), today + timedelta(days=10))
+    cal = d.build_calendar([run(last_sunday, 10), gym], [], [], 330, today + timedelta(days=10))
     for w in cal["weeks"]:
         assert len(w["days"]) == 7
         assert date.fromisoformat(w["days"][0]["date"]).weekday() == 0, "ogni settimana inizia di lunedì"

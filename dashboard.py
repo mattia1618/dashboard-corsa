@@ -682,44 +682,6 @@ def classify_effort(a, pb_5k_pace_sec_km):
     return "easy"
 
 
-def build_recent_table(activities, weeks, pb_5k_pace_sec_km):
-    today = date.today()
-    start = today - timedelta(weeks=weeks)
-    rows = []
-    for a in activities:
-        try:
-            dt = datetime.strptime(a.get("startTimeLocal"), "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            continue
-        if dt.date() < start:
-            continue
-        dist_km = (a.get("distance") or 0) / 1000.0
-        dur_s = a.get("duration") or 0
-        pace = None
-        if is_pace_sport(a) and dist_km:
-            pace = sec_to_pace_str(dur_s / dist_km)
-        effort = classify_effort(a, pb_5k_pace_sec_km)
-        if effort == "easy" and not is_pace_sport(a):
-            effort = "other"  # palestra/yoga/bici: "Facile" non ha senso
-        rows.append({
-            "activity_id": str(a.get("activityId")),
-            "date": dt.strftime("%d/%m/%Y"),
-            "sort_key": dt.isoformat(),
-            "name": a.get("activityName") or sport_label(a),
-            "sport": sport_label(a),
-            "distance_km": round(dist_km, 2) if dist_km else None,
-            "pace": pace,
-            "avg_hr": round(a["averageHR"]) if a.get("averageHR") else None,
-            "max_hr": round(a["maxHR"]) if a.get("maxHR") else None,
-            "type": effort,
-            "duration": sec_to_hms(dur_s) if dur_s else None,
-        })
-    rows.sort(key=lambda r: r["sort_key"], reverse=True)
-    for r in rows:
-        del r["sort_key"]
-    return rows
-
-
 def build_week_row(running_activities, pb_5k_pace_sec_km):
     today = date.today()
     monday = today - timedelta(days=today.weekday())
@@ -746,7 +708,7 @@ def build_week_row(running_activities, pb_5k_pace_sec_km):
     return result
 
 
-def build_calendar(activities, load_series, races, pb_5k_pace_sec_km, detail_ids, until):
+def build_calendar(activities, load_series, races, pb_5k_pace_sec_km, until):
     """Settimane lun-dom per la scheda Calendario: attività di ogni giorno e riepilogo della settimana."""
     today = date.today()
     start = today - timedelta(days=today.weekday(), weeks=CALENDAR_WEEKS_BACK)
@@ -768,7 +730,11 @@ def build_calendar(activities, load_series, races, pb_5k_pace_sec_km, detail_ids
             "hr": round(a["averageHR"]) if a.get("averageHR") else None,
             "load": round(estimate_load(a)),
             "kind": classify_effort(a, pb_5k_pace_sec_km) if is_pace_sport(a) else None,
-            "detail": str(a.get("activityId")) in detail_ids,
+            "summary": build_activity_summary(a),
+            "te": round(a["aerobicTrainingEffect"], 1) if a.get("aerobicTrainingEffect") else None,
+            "desc": a.get("description") or "",
+            "feel": a.get("directWorkoutFeel"),  # Garmin: 0, 25, 50, 75, 100
+            "rpe": a.get("directWorkoutRpe"),    # Garmin: 10-100
         })
     load_by_day = {p["date"]: p for p in load_series}
     weeks = []
@@ -779,7 +745,7 @@ def build_calendar(activities, load_series, races, pb_5k_pace_sec_km, detail_ids
         flat = [x for day in acts for x in day]
         form = load_by_day.get(min(days[-1], today).isoformat()) if monday <= today else None
         weeks.append({
-            "days": [{"date": d.isoformat(), "acts": day} for d, day in zip(days, acts)],
+            "days": [{"date": d.isoformat(), "acts": day, "form": load_by_day.get(d.isoformat())} for d, day in zip(days, acts)],
             "dur": sum(x["dur"] for x in flat),
             "km": round(sum(x["km"] or 0 for x in flat), 1),
             "run_km": round(sum(x["km"] or 0 for x in flat if x["group"] == "run"), 1),
@@ -856,14 +822,6 @@ def build_activity_summary(a):
         "cadenza_media": f"{round(avg_cadence)}" if avg_cadence else "—",
         "calorie": f"{round(a.get('calories'))} kcal" if a.get("calories") else "—",
     }
-
-
-def js_escape(s):
-    """Rende sicura una stringa da inserire dentro un attributo onclick con
-    apici singoli in JS (es. nomi di allenamenti con apostrofi tipo 8x1')."""
-    if s is None:
-        return ""
-    return str(s).replace("\\", "\\\\").replace("'", "\\'").replace('"', "&quot;")
 
 
 def json_for_script(obj):
@@ -979,12 +937,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
   th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--panel-border); }}
   th {{ color: var(--muted); font-weight: 500; font-size: 12px; }}
-  tr.clickable {{ cursor: pointer; }}
-  tr.clickable:hover td, tr.clickable:focus-visible td {{ background: var(--panel-hover); }}
-  tr.clickable:focus-visible {{ outline-offset: -2px; }}
-  .badge {{ padding: 2px 8px; border-radius: 20px; font-size: 12px; font-weight: 600; white-space: nowrap; }}
-  .badge.easy {{ background: rgba(104,211,145,0.15); color: var(--good); }}
-  .badge.workout {{ background: rgba(246,173,85,0.15); color: var(--accent2); }}
+  /* finestra allenamento: intestazione, barra dei numeri, due colonne, poi percorso e grafici */
+  .wk-top {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }}
+  .wk-date {{ color: var(--info); font-weight: 600; text-transform: capitalize; }}
+  .wk-chips {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+  .wk-chip {{ --c: var(--muted); border: 1px solid var(--c); color: var(--c); border-radius: 6px; padding: 3px 8px; font-size: 12px; font-weight: 600; }}
+  .wk-chip.ctl {{ --c: var(--accent); }}
+  .wk-chip.atl {{ --c: var(--danger); }}
+  .wk-chip.tsb {{ --c: var(--accent2); }}
+  .wk-bar {{ background: var(--panel-hover); border: 1px solid var(--panel-border); border-left: 4px solid var(--c, var(--muted)); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }}
+  .wk-bar.run {{ --c: var(--accent); }}
+  .wk-bar.bike {{ --c: var(--info); }}
+  .wk-bar.swim {{ --c: var(--hrv); }}
+  .wk-bar.strength {{ --c: var(--accent2); }}
+  .wk-big {{ display: flex; flex-wrap: wrap; gap: 6px 26px; align-items: baseline; margin: 4px 0; }}
+  .wk-big b {{ font-size: 26px; font-weight: 700; }}
+  .wk-big span {{ color: var(--muted); font-size: 13px; }}
+  .wk-sport {{ color: var(--muted); font-size: 13px; }}
+  .wk-cols {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; margin-bottom: 18px; }}
+  .wk-cols h4, .wk-more {{ margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }}
+  .wk-table td:first-child {{ color: var(--muted); }}
+  .wk-table td:last-child {{ font-weight: 600; text-align: right; }}
+  .wk-side p {{ margin: 0 0 14px; }}
+  .wk-desc {{ background: var(--panel-hover); border-radius: 8px; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }}
+  .wk-scale {{ display: flex; gap: 4px; margin-bottom: 14px; }}
+  .wk-scale span {{ flex: 1; text-align: center; font-size: 11px; color: var(--muted); padding: 6px 2px; border-radius: 6px; background: var(--panel-hover); }}
+  .wk-scale span.on {{ background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); font-weight: 600; }}
+  .wk-more {{ border-top: 1px solid var(--panel-border); padding-top: 14px; }}
+  @media (max-width: 640px) {{
+    .wk-cols {{ grid-template-columns: 1fr; }}
+    .wk-big b {{ font-size: 22px; }}
+  }}
   .muted {{ color: var(--muted); }}
   canvas {{ max-height: 260px; }}
 
@@ -1136,7 +1119,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <nav class="tabs" role="tablist" aria-label="Sezioni">
     <button class="tabbtn" role="tab" id="tab-fitness" aria-controls="section-fitness" aria-selected="true" onclick="showSection('fitness', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/></svg>Forma</button>
     <button class="tabbtn" role="tab" id="tab-recovery" aria-controls="section-recovery" aria-selected="false" tabindex="-1" onclick="showSection('recovery', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/></svg>Recupero</button>
-    <button class="tabbtn" role="tab" id="tab-runs" aria-controls="section-runs" aria-selected="false" tabindex="-1" onclick="showSection('runs', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>Allenamenti</button>
     <button class="tabbtn" role="tab" id="tab-calendar" aria-controls="section-calendar" aria-selected="false" tabindex="-1" onclick="showSection('calendar', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>Calendario</button>
     <button class="tabbtn" role="tab" id="tab-me" aria-controls="section-me" aria-selected="false" tabindex="-1" onclick="showSection('me', this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/></svg>Io</button>
   </nav>
@@ -1158,14 +1140,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico FC a riposo" onclick="openEnlarge('rhr')"><h2>FC a riposo</h2><div class="desc">Ultime {recovery_weeks} settimane. Se sale di 5 o più battiti per qualche giorno, il corpo chiede riposo.</div>{rhr_chart_or_missing}</div>
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Sonno" onclick="openEnlarge('sleep')"><h2>Sonno</h2><div class="desc">Ore di sonno per notte.</div>{sleep_chart_or_missing}</div>
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico VO2 max" onclick="openEnlarge('vo2')"><h2>VO2 max</h2><div class="desc">Stima del device Garmin della tua capacità aerobica.</div>{vo2_chart_or_missing}</div>
-    </div>
-  </div>
-
-  <div class="section" id="section-runs" role="tabpanel" aria-labelledby="tab-runs">
-    <div class="panel full">
-      <h2>Allenamenti recenti</h2>
-      <div class="desc">Ultime {table_weeks} settimane, tutti gli sport. Clicca una riga (o premi Invio) per il dettaglio.</div>
-      {table_or_missing}
     </div>
   </div>
 
@@ -1369,7 +1343,7 @@ document.addEventListener('keydown', (e) => {{
     else if (!e.shiftKey && document.activeElement === f[f.length - 1]) {{ e.preventDefault(); f[0].focus(); }}
     return;
   }}
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[role="button"], tr.clickable')) {{
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[role="button"]')) {{
     e.preventDefault();
     e.target.click();
   }}
@@ -1579,9 +1553,7 @@ function actCard(a, iso) {{
   const kind = a.kind === 'workout' ? 'qualità' : a.kind === 'easy' ? 'facile' : '';
   const extra = [esc(a.sport) + (kind ? ' ' + kind : ''), a.load ? 'carico ' + a.load : '', a.hr ? a.hr + ' bpm' : ''].filter(Boolean).join(' · ');
   const inner = '<div class="t">' + esc(a.name) + '</div>' + (main ? '<div class="s">' + main + '</div>' : '') + '<div class="s">' + extra + '</div>';
-  const cls = 'cal-card ' + a.group;
-  if (!a.detail) return '<div class="' + cls + '">' + inner + '</div>';
-  return '<button type="button" class="' + cls + '" data-id="' + esc(a.id) + '" data-title="' + esc(a.name + ' · ' + fmtDate(iso)) + '" aria-label="' + esc(a.name + ', ' + fmtDate(iso) + ': apri il dettaglio') + '">' + inner + '</button>';
+  return '<button type="button" class="cal-card ' + a.group + '" data-id="' + esc(a.id) + '" aria-label="' + esc(a.name + ', ' + fmtDate(iso) + ': apri il dettaglio') + '">' + inner + '</button>';
 }}
 function raceCard(r) {{
   const label = r.date === GOAL.date ? 'Il tuo obiettivo' : 'Gara';
@@ -1628,7 +1600,7 @@ function scrollCalendarToToday(smooth) {{
 }}
 document.getElementById('calendar').addEventListener('click', e => {{
   const b = e.target.closest('button.cal-card');
-  if (b) openDetail(b.dataset.id, b.dataset.title);
+  if (b) openDetail(b.dataset.id);
 }});
 
 try {{ renderGoal(); }} catch (e) {{ console.error('Errore obiettivo', e); }}
@@ -1792,12 +1764,46 @@ function animateRoute() {{
   requestAnimationFrame(frame);
 }}
 
-function openDetail(activityId, title) {{
+// attività del calendario per id, con il giorno e la forma di quel giorno
+const ACTS = {{}};
+CALENDAR.weeks.forEach(w => w.days.forEach(d => d.acts.forEach(a => {{ ACTS[a.id] = Object.assign({{ date: d.date, form: d.form }}, a); }})));
+const FEELS = ['Molto male', 'Male', 'Normale', 'Bene', 'Benissimo'];
+
+function workoutHead(a, summary) {{
+  const [y, m, d] = a.date.split('-').map(Number);
+  const when = new Date(y, m - 1, d).toLocaleDateString('it-IT', {{ weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }});
+  const chips = a.form ? '<div class="wk-chips"><span class="wk-chip ctl">Forma ' + a.form.ctl + '</span><span class="wk-chip atl">Fatica ' + a.form.atl + '</span><span class="wk-chip tsb">Freschezza ' + (a.form.tsb > 0 ? '+' : '') + a.form.tsb + '</span></div>' : '';
+  const big = [a.dur ? '<b>' + fmtDur(a.dur) + '</b>' : '', a.km ? '<b>' + a.km + '</b> <span>km</span>' : '', a.load ? '<b>' + a.load + '</b> <span>carico</span>' : ''].filter(Boolean).map(x => '<div>' + x + '</div>').join('');
+  const kind = a.kind === 'workout' ? ' · qualità' : a.kind === 'easy' ? ' · facile' : '';
+
+  const rows = [
+    ['Durata', summary.durata], ['Distanza', summary.distanza], ['Passo medio', summary.passo_medio],
+    ['FC media', summary.fc_media], ['FC max', summary.fc_max], ['Cadenza (passi/min)', summary.cadenza_media],
+    ['Dislivello', summary.dislivello], ['Calorie', summary.calorie],
+    ['Carico', a.load || null], ['Effetto allenante aerobico', a.te],
+  ].filter(r => r[1] && r[1] !== '—');
+  const feel = a.feel === null || a.feel === undefined ? -1 : Math.round(a.feel / 25);
+  const scale = feel >= 0 ? '<div class="wk-scale" role="img" aria-label="Sensazioni: ' + FEELS[feel] + '">' + FEELS.map((f, i) => '<span class="' + (i === feel ? 'on' : '') + '">' + f + '</span>').join('') + '</div>'
+    : '<p class="muted">Non inserite sull’orologio.</p>';
+  const rpe = a.rpe ? '<p><strong>' + Math.round(a.rpe / 10) + '</strong> su 10</p>' : '<p class="muted">Non inserito sull’orologio.</p>';
+
+  return '<div class="wk-top"><div class="wk-date">' + when + ' · ' + a.time + '</div>' + chips + '</div>'
+    + '<div class="wk-bar ' + a.group + '"><div class="wk-big">' + big + '</div><div class="wk-sport">' + esc(a.sport) + kind + '</div></div>'
+    + '<div class="wk-cols"><div><h4>Dati dell’allenamento</h4><table class="wk-table"><tbody>'
+    + rows.map(r => '<tr><td>' + r[0] + '</td><td>' + esc(r[1]) + '</td></tr>').join('') + '</tbody></table></div>'
+    + '<div class="wk-side"><h4>Note</h4><p class="wk-desc">' + (a.desc ? esc(a.desc) : '<span class="muted">Nessuna nota su Garmin.</span>') + '</p>'
+    + '<h4>Come ti sei sentito</h4>' + scale + '<h4>Sforzo percepito</h4>' + rpe + '</div></div>';
+}}
+
+function openDetail(activityId) {{
   const ts = ACTIVITY_TIMESERIES[activityId];
-  document.getElementById('detailTitle').textContent = title;
+  const act = ACTS[activityId];
+  if (!act) return;
+  const summary = ACTIVITY_SUMMARY[activityId] || act.summary;
+  document.getElementById('detailTitle').textContent = act.name;
 
   const body = document.getElementById('detailBody');
-  body.innerHTML = '';
+  body.innerHTML = workoutHead(act, summary) + '<h4 class="wk-more">Percorso e grafici</h4>';
   currentTs = ts || null;
 
   if (ts && ts.lat && ts.lat.length > 5) {{
@@ -1815,28 +1821,8 @@ function openDetail(activityId, title) {{
   }} else {{
     const msg = document.createElement('div');
     msg.className = 'missing';
-    msg.textContent = 'Nessuna traccia GPS disponibile per questa attività.';
+    msg.textContent = ts ? 'Nessuna traccia GPS per questa attività.' : 'Percorso e grafici ci sono solo per le ultime 4 settimane.';
     body.appendChild(msg);
-  }}
-
-  const summary = ACTIVITY_SUMMARY[activityId];
-  if (summary) {{
-    const statsWrap = document.createElement('div');
-    statsWrap.className = 'detail-stats';
-    const labels = {{
-      distanza: 'Distanza', durata: 'Durata', passo_medio: 'Passo medio',
-      fc_media: 'FC media', fc_max: 'FC max', dislivello: 'Dislivello',
-      cadenza_media: 'Cadenza (passi/min)', calorie: 'Calorie'
-    }};
-    Object.keys(labels).forEach(k => {{
-      if (summary[k] && summary[k] !== '—') {{
-        const box = document.createElement('div');
-        box.className = 'dstat';
-        box.innerHTML = `<div class="v">${{summary[k]}}</div><div class="l">${{labels[k]}}</div>`;
-        statsWrap.appendChild(box);
-      }}
-    }});
-    body.appendChild(statsWrap);
   }}
 
   const grid = document.createElement('div');
@@ -1961,16 +1947,17 @@ def main():
 
     pb_5k_sec = next((r["seconds"] for r in profile["records"] if r["label"] == "5 km"), ATHLETE["pb_5k_sec"])
     pb_5k_pace_sec_km = pb_5k_sec / 5.0
-    recent_rows = build_recent_table(activities, ACTIVITY_TABLE_WEEKS, pb_5k_pace_sec_km)
     week_row = build_week_row(running_activities, pb_5k_pace_sec_km)
 
     today = date.today()
     insights = compute_insights(mileage, vo2_series)
 
-    recent_activities_raw = [a for a in activities if str(a.get("activityId")) in {r["activity_id"] for r in recent_rows}]
+    # percorso e grafici solo per le ultime settimane: ogni attività è una chiamata in più a Garmin
+    recent_from = (date.today() - timedelta(weeks=ACTIVITY_TABLE_WEEKS)).isoformat()
+    recent_activities_raw = [a for a in activities if (a.get("startTimeLocal") or "") >= recent_from]
     activity_details, activity_timeseries = fetch_activity_details(client, recent_activities_raw)
     activity_summary = {str(a.get("activityId")): build_activity_summary(activity_details.get(str(a.get("activityId")), a)) for a in recent_activities_raw}
-    calendar = build_calendar(activities, load_series, races, pb_5k_pace_sec_km, set(activity_summary), date.fromisoformat(goal["date"]))
+    calendar = build_calendar(activities, load_series, races, pb_5k_pace_sec_km, date.fromisoformat(goal["date"]))
 
     card_ctl = f"{load_series[-1]['ctl']}" if load_series else "—"
     card_atl = f"{load_series[-1]['atl']}" if load_series else "—"
@@ -2067,26 +2054,6 @@ new Chart(document.getElementById('sleepChart'), {{
 }} catch(e) {{ console.error('Errore grafico sleepChart', e); }}""")
         chart_scripts.append(f"try {{ registerChart('sleep', {json.dumps(sleep_labels)}, [{{label:'Ore di sonno', data:{json.dumps([p['hours'] for p in sleep_series])}, backgroundColor:'#63b3ed'}}], 'bar', 'Sonno', {json.dumps(sleep_has_today)}); }} catch(e) {{ console.error('registerChart sleep', e); }}")
 
-    type_labels = {"easy": "Facile", "workout": "Allenamento"}
-    if recent_rows:
-        def _row_html(r):
-            dist_cell = f"{r['distance_km']} km" if r['distance_km'] else "—"
-            safe_title = js_escape(f"{r['name']} · {r['date']}")
-            badge = f"<span class='badge {r['type']}'>{type_labels[r['type']]}</span>" if r['type'] in type_labels else "<span class='muted'>—</span>"
-            return (
-                f"<tr class='clickable' tabindex='0' onclick=\"openDetail('{r['activity_id']}', '{safe_title}')\">"
-                f"<td>{r['date']}</td><td class='hide-sm'>{r['sport']}</td><td>{r['name']}</td>"
-                f"<td>{dist_cell}</td><td>{r['duration'] or '—'}</td>"
-                f"<td>{r['pace'] or '—'}</td><td>{r['avg_hr'] or '—'}</td><td class='hide-sm'>{r['max_hr'] or '—'}</td>"
-                f"<td>{badge}</td></tr>"
-            )
-        rows_html = "\n".join(_row_html(r) for r in recent_rows)
-        table_html = f"""<div class="table-wrap"><table>
-<thead><tr><th>Data</th><th class="hide-sm">Sport</th><th>Nome</th><th>Distanza</th><th>Durata</th><th>Passo</th><th>FC media</th><th class="hide-sm">FC max</th><th>Tipo</th></tr></thead>
-<tbody>{rows_html}</tbody></table></div>"""
-    else:
-        table_html = None
-
     if insights or load_series:
         insights_html = "\n".join(f'<div class="insight {i["color"]}"><h2>{i["title"]}</h2><p>{i["text"]}</p></div>' for i in insights)
     else:
@@ -2116,7 +2083,7 @@ new Chart(document.getElementById('sleepChart'), {{
         "predictions_json": json_for_script(predictions),
         "goal_json": json_for_script(goal),
         "calendar_json": json_for_script(calendar),
-        "weeks_trend": WEEKS_TREND, "recovery_weeks": RECOVERY_LOOKBACK_DAYS // 7, "table_weeks": ACTIVITY_TABLE_WEEKS,
+        "weeks_trend": WEEKS_TREND, "recovery_weeks": RECOVERY_LOOKBACK_DAYS // 7,
         "card_ctl": card_ctl, "card_atl": card_atl, "card_vo2": card_vo2, "card_rhr": card_rhr, "card_hrv": card_hrv,
         "delta_ctl": delta_html(delta_7d(load_series, "ctl"), True),
         "delta_atl": delta_html(delta_7d(load_series, "atl"), None),
@@ -2132,7 +2099,6 @@ new Chart(document.getElementById('sleepChart'), {{
         "hrv_chart_or_missing": render_or_missing(len(hrv_series) > 0, canvas("hrvChart", f"Grafico HRV, ultimo valore {card_hrv}"), "Nessun dato HRV trovato."),
         "rhr_chart_or_missing": render_or_missing(len(rhr_series) > 0, canvas("rhrChart", f"Grafico FC a riposo, ultimo valore {card_rhr}"), "Nessun dato di FC a riposo trovato."),
         "sleep_chart_or_missing": render_or_missing(len(sleep_series) > 0, canvas("sleepChart", f"Ore di sonno, ultima notte {last(sleep_series, 'hours')} ore"), "Nessun dato di sonno trovato."),
-        "table_or_missing": table_html or '<div class="missing">Nessuna corsa nelle ultime settimane.</div>',
         "chart_scripts": "\n".join(chart_scripts),
         "chartjs_source": chartjs_source,
         "activity_timeseries_json": json_for_script(activity_timeseries),
