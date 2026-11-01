@@ -185,12 +185,6 @@ def delta_7d(series, key="value"):
     return round(series[-1][key] - older[-1][key], 1) if older else None
 
 
-def sec_to_mmss(sec):
-    m = int(sec // 60)
-    s = int(round(sec % 60))
-    return f"{m}:{s:02d}"
-
-
 def downsample(seq, max_points):
     n = len(seq)
     if n <= max_points:
@@ -1261,7 +1255,6 @@ Chart.defaults.color = '#8b93a9';
 Chart.defaults.borderColor = '#2c2c2e';
 Chart.defaults.font.size = 11;
 Chart.defaults.plugins.legend.display = false;
-const GENERATED_ISO = '{generated_iso}';
 const X_TICKS = {{ maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }};
 
 /* Plugin: fasce colorate di sfondo (zone della Freschezza/TSB) */
@@ -1650,8 +1643,12 @@ async function checkNewVersion() {{
     const r = await fetch('version.txt?t=' + Date.now(), {{ cache: 'no-store' }});
     if (!r.ok) return;
     const v = (await r.text()).trim();
-    // il ?v= nuovo evita che il telefono riprenda la pagina vecchia dalla sua cache
-    if (/^[0-9]{{12}}$/.test(v) && v > GENERATED_STAMP) location.replace(location.pathname + '?v=' + v);
+    if (!/^[0-9]{{12}}$/.test(v) || v <= GENERATED_STAMP) return;
+    // la cache di GitHub ignora il ?v= e può ridare la pagina vecchia per qualche minuto:
+    // una sola ricarica per versione, altrimenti la pagina si ricaricherebbe all'infinito
+    if (sessionStorage.getItem('ricaricata') === v) return;
+    sessionStorage.setItem('ricaricata', v);
+    location.replace(location.pathname + '?v=' + v);
   }} catch (e) {{}}
 }}
 checkNewVersion();
@@ -2112,7 +2109,6 @@ new Chart(document.getElementById('sleepChart'), {{
     generated_stamp = now.strftime("%Y%m%d%H%M")
     ctx = {
         "page_title": escape(goal["name"]),
-        "generated_iso": today.isoformat(),
         "generated_stamp": generated_stamp,
         "generated_label": now.strftime("%d/%m alle %H:%M"),
         "tsb_now": json.dumps(load_series[-1]["tsb"] if load_series else None),
