@@ -990,7 +990,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .detail-stats .dstat .v {{ font-size: 17px; font-weight: 700; }}
   .detail-stats .dstat .l {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
   .route-wrap {{ background: var(--panel-hover); border-radius: 10px; padding: 8px; margin-bottom: 10px; }}
-  .route-wrap svg {{ width: 100%; height: 220px; display: block; }}
+  .route-wrap svg {{ width: 100%; height: auto; aspect-ratio: 600 / 260; display: block; border-radius: 8px; background: var(--panel); }}
+  .route-credit {{ font-size: 11px; color: var(--muted); text-align: right; margin-top: 4px; }}
+  .route-legend {{ display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12px; color: var(--muted); margin-top: 6px; }}
+  .route-legend i {{ width: 90px; height: 6px; border-radius: 3px; background: linear-gradient(90deg, var(--info), var(--accent2), var(--danger)); }}
+  .route-legend em {{ font-style: normal; flex-basis: 100%; }}
   .replay-btn {{ background: var(--panel-hover); border: 1px solid var(--panel-border); color: var(--accent); font-size: 13px; padding: 6px 12px; border-radius: 8px; cursor: pointer; font-family: inherit; margin-bottom: 14px; }}
   .mini-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 12px; margin-top: 10px; }}
   .mini-panel {{ background: var(--panel-hover); border-radius: 10px; padding: 10px; cursor: zoom-in; transition: outline-color .15s; outline: 1px solid transparent; }}
@@ -1718,47 +1722,84 @@ function sparkline(elemId, values, color, labels) {{
 const ACTIVITY_TIMESERIES = {activity_timeseries_json};
 const ACTIVITY_SUMMARY = {activity_summary_json};
 
-function buildRouteSvg(lat, lon) {{
-  const W = 600, H = 220, PAD = 14;
-  const latMin = Math.min(...lat), latMax = Math.max(...lat);
-  const lonMin = Math.min(...lon), lonMax = Math.max(...lon);
-  // un grado di longitudine è più corto di uno di latitudine: cos(lat) evita il percorso schiacciato
-  const kx = Math.cos((latMin + latMax) / 2 * Math.PI / 180);
-  const spanX = ((lonMax - lonMin) * kx) || 0.0001;
-  const spanY = (latMax - latMin) || 0.0001;
-  const scale = Math.min((W - 2 * PAD) / spanX, (H - 2 * PAD) / spanY);
-  const offX = (W - spanX * scale) / 2, offY = (H - spanY * scale) / 2;
-  const pts = lat.map((la, i) => {{
-    const x = offX + (lon[i] - lonMin) * kx * scale;
-    const y = offY + (latMax - la) * scale;
-    return [x, y];
-  }});
-  const d = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
-  return {{ svg: `<svg viewBox="0 0 ${{W}} ${{H}}" xmlns="http://www.w3.org/2000/svg">
-      <path id="routePath" d="${{d}}" fill="none" stroke="#1c2650" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-      <path id="routePathAnim" d="${{d}}" fill="none" stroke="#4fd1c5" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-      <circle id="routeDot" r="6" fill="#f6ad55"/>
-    </svg>`, pts }};
+/* percorso su foto satellitare: tile di Esri World Imagery (gratuite, senza chiave) disegnate
+   nello stesso SVG della linea, con la stessa proiezione (Web Mercator), così combaciano */
+const ROUTE_W = 600, ROUTE_H = 260, ROUTE_PAD = 24;
+let routePts = [];
+
+function mercator(la, lo, z) {{
+  const n = 256 * Math.pow(2, z), s = Math.sin(la * Math.PI / 180);
+  return [(lo + 180) / 360 * n, (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * n];
+}}
+
+function cssColor(name) {{
+  const h = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+}}
+
+// lento = blu, medio = arancione, veloce = rosso; ratio = passo / passo di riferimento
+function paceColor(ratio) {{
+  const t = Math.max(0, Math.min(1, (1.25 - ratio) / 0.25));
+  const [a, b, k] = t < 0.5 ? [cssColor('--info'), cssColor('--accent2'), t * 2] : [cssColor('--accent2'), cssColor('--danger'), (t - 0.5) * 2];
+  return 'rgb(' + a.map((v, i) => Math.round(v + (b[i] - v) * k)).join(',') + ')';
+}}
+
+function routeRefPace(act, paces) {{
+  // corsa: ritmo gara Garmin sui 10 km; altri sport: il 10% più veloce di quella attività
+  if (act && act.group === 'run' && PREDICTIONS['10']) return PREDICTIONS['10'] / 10;
+  const sorted = paces.filter(v => v).sort((a, b) => a - b);
+  return sorted.length ? sorted[Math.floor(sorted.length * 0.1)] : null;
+}}
+
+function buildRouteSvg(ts, act) {{
+  const idx = ts.lat.map((v, i) => i).filter(i => ts.lat[i] !== null && ts.lon[i] !== null);
+  const lat = idx.map(i => ts.lat[i]), lon = idx.map(i => ts.lon[i]);
+  const paces = idx.map(i => (ts.pace_sec_km || [])[i] || null);
+  const latMin = Math.min(...lat), latMax = Math.max(...lat), lonMin = Math.min(...lon), lonMax = Math.max(...lon);
+  let z = 18;
+  for (; z > 2; z--) {{
+    const [x0, y0] = mercator(latMax, lonMin, z), [x1, y1] = mercator(latMin, lonMax, z);
+    if (x1 - x0 <= ROUTE_W - 2 * ROUTE_PAD && y1 - y0 <= ROUTE_H - 2 * ROUTE_PAD) break;
+  }}
+  const [cx, cy] = mercator((latMin + latMax) / 2, (lonMin + lonMax) / 2, z);
+  const ox = cx - ROUTE_W / 2, oy = cy - ROUTE_H / 2;
+  routePts = lat.map((la, i) => {{ const [x, y] = mercator(la, lon[i], z); return [x - ox, y - oy]; }});
+
+  let tiles = '';
+  for (let tx = Math.floor(ox / 256); tx <= Math.floor((ox + ROUTE_W) / 256); tx++) {{
+    for (let ty = Math.floor(oy / 256); ty <= Math.floor((oy + ROUTE_H) / 256); ty++) {{
+      tiles += `<image href="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${{z}}/${{ty}}/${{tx}}" x="${{(tx * 256 - ox).toFixed(1)}}" y="${{(ty * 256 - oy).toFixed(1)}}" width="256" height="256"/>`;
+    }}
+  }}
+  const ref = routeRefPace(act, paces);
+  let segs = '';
+  for (let i = 1; i < routePts.length; i++) {{
+    const pace = paces[i] || paces[i - 1];
+    const color = ref && pace ? paceColor(pace / ref) : 'var(--accent)';
+    segs += `<line x1="${{routePts[i - 1][0].toFixed(1)}}" y1="${{routePts[i - 1][1].toFixed(1)}}" x2="${{routePts[i][0].toFixed(1)}}" y2="${{routePts[i][1].toFixed(1)}}" style="stroke:${{color}}"/>`;
+  }}
+  const raceRef = act && act.group === 'run' && PREDICTIONS['10'];
+  const legend = ref ? `<div class="route-legend"><span>Lento</span><i aria-hidden="true"></i><span>Veloce</span><em>${{raceRef ? 'Rosso = il tuo ritmo gara Garmin sui 10 km (' + fmtPace(ref) + '/km)' : 'Colori rispetto al passo di questa attività'}}</em></div>` : '';
+  return `<svg viewBox="0 0 ${{ROUTE_W}} ${{ROUTE_H}}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Percorso su mappa satellitare, colorato in base alla velocità">
+      ${{tiles}}
+      <g id="routeSegs" stroke-width="2.5" stroke-linecap="round">${{segs}}</g>
+      <circle id="routeDot" r="5" style="fill:var(--text);stroke:var(--bg);stroke-width:1.5"/>
+    </svg><div class="route-credit">Immagini © Esri, Maxar, Earthstar Geographics</div>${{legend}}`;
 }}
 
 function animateRoute() {{
-  const path = document.getElementById('routePathAnim');
+  const segs = document.querySelectorAll('#routeSegs line');
   const dot = document.getElementById('routeDot');
-  if (!path || !dot) return;
-  const len = path.getTotalLength();
-  path.style.transition = 'none';
-  path.style.strokeDasharray = len;
-  path.style.strokeDashoffset = len;
-  void path.getBoundingClientRect();
-  const duration = 2500;
+  if (!dot || !routePts.length) return;
+  const duration = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 2500;
   const start = performance.now();
   function frame(now) {{
-    const t = Math.min(1, (now - start) / duration);
-    const eased = t;
-    path.style.strokeDashoffset = len * (1 - eased);
-    const p = path.getPointAtLength(len * eased);
-    dot.setAttribute('cx', p.x);
-    dot.setAttribute('cy', p.y);
+    const t = duration ? Math.min(1, (now - start) / duration) : 1;
+    const k = Math.round(t * segs.length);
+    segs.forEach((l, i) => {{ l.style.visibility = i < k ? 'visible' : 'hidden'; }});
+    const pt = routePts[Math.min(routePts.length - 1, k)];
+    dot.setAttribute('cx', pt[0]);
+    dot.setAttribute('cy', pt[1]);
     if (t < 1) requestAnimationFrame(frame);
   }}
   requestAnimationFrame(frame);
@@ -1809,8 +1850,7 @@ function openDetail(activityId) {{
   if (ts && ts.lat && ts.lat.length > 5) {{
     const wrap = document.createElement('div');
     wrap.className = 'route-wrap';
-    const {{ svg }} = buildRouteSvg(ts.lat, ts.lon);
-    wrap.innerHTML = svg;
+    wrap.innerHTML = buildRouteSvg(ts, act);
     body.appendChild(wrap);
 
     const replay = document.createElement('button');
