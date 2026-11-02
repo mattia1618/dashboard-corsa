@@ -139,20 +139,6 @@ def iso_week_key(d):
     return f"{y}-W{w:02d}"
 
 
-def linreg(xs, ys):
-    n = len(xs)
-    if n < 2:
-        return 0.0, (ys[0] if ys else 0.0)
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    num = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
-    den = sum((xs[i] - mean_x) ** 2 for i in range(n))
-    if den == 0:
-        return 0.0, mean_y
-    slope = num / den
-    return slope, mean_y - slope * mean_x
-
-
 def sec_to_pace_str(sec_per_km):
     if sec_per_km is None or sec_per_km <= 0 or math.isinf(sec_per_km):
         return None
@@ -282,7 +268,7 @@ def fetch_daily_wellness(client, since_days):
     print(f"  -> Scarico dati di recupero (RHR/sonno/HRV) ultimi {since_days} giorni...")
     today = date.today()
     start = today - timedelta(days=since_days)
-    rhr_series, sleep_series, hrv_series = [], [], []
+    rhr_series, sleep_series, hrv_series, stress_series = [], [], [], []
     found = {"rhr": 0, "sleep": 0, "hrv": 0}
 
     for d in daterange(start, today):
@@ -292,6 +278,9 @@ def fetch_daily_wellness(client, since_days):
         if rhr:
             rhr_series.append({"date": ds, "value": rhr})
             found["rhr"] += 1
+        stress = stats.get("averageStressLevel") if stats else None
+        if stress and stress > 0:  # Garmin usa -1/-2 per "non misurato"
+            stress_series.append({"date": ds, "value": stress})
 
         sleep = safe(client.get_sleep_data, ds)
         if sleep:
@@ -311,8 +300,82 @@ def fetch_daily_wellness(client, since_days):
 
         time.sleep(0.05)
 
-    print(f"     RHR: {found['rhr']} giorni | Sonno: {found['sleep']} giorni | HRV: {found['hrv']} giorni")
-    return rhr_series, sleep_series, hrv_series
+    print(f"     RHR: {found['rhr']} giorni | Sonno: {found['sleep']} giorni | HRV: {found['hrv']} giorni | Stress: {len(stress_series)} giorni")
+    return rhr_series, sleep_series, hrv_series, stress_series
+
+
+def fetch_stress_day(client):
+    """Stress ogni 3 minuti di oggi (o di ieri se oggi non c'è ancora niente), come il grafico Garmin."""
+    for d in (date.today(), date.today() - timedelta(days=1)):
+        raw = safe(client.get_stress_data, d.isoformat()) or {}
+        points = [p for p in (raw.get("stressValuesArray") or []) if p and len(p) >= 2]
+        if any(p[1] is not None and p[1] >= 0 for p in points):
+            return {
+                "date": d.isoformat(),
+                "labels": [datetime.fromtimestamp(p[0] / 1000).strftime("%H:%M") for p in points],
+                # -1/-2 = attività o non misurato: buco nel grafico
+                "values": [p[1] if p[1] is not None and p[1] >= 0 else None for p in points],
+                "avg": raw.get("avgStressLevel"),
+            }
+    return None
+
+
+def fetch_training_load(client):
+    """Carico acuto e focus carico ufficiali Garmin (dallo stato di allenamento)."""
+    raw = safe(client.get_training_status, date.today().isoformat()) or {}
+    status = next(iter(((raw.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}).values()), {}) or {}
+    acute = status.get("acuteTrainingLoadDTO") or {}
+    balance = next(iter(((raw.get("mostRecentTrainingLoadBalance") or {}).get("metricsTrainingLoadBalanceDTOMap") or {}).values()), {}) or {}
+    if not acute.get("dailyTrainingLoadAcute") and not balance:
+        return None
+    focus = [
+        {"label": label, "value": round(balance[f"monthlyLoad{key}"]), "min": balance.get(f"monthlyLoad{key}TargetMin"), "max": balance.get(f"monthlyLoad{key}TargetMax"), "color": color}
+        for key, label, color in (("AerobicLow", "Aerobico basso", "#4fd1c5"), ("AerobicHigh", "Aerobico alto", "#f6ad55"), ("Anaerobic", "Anaerobico", "#b794f4"))
+        if balance.get(f"monthlyLoad{key}") is not None
+    ]
+    return {
+        "acute": acute.get("dailyTrainingLoadAcute"),
+        "min": acute.get("minTrainingLoadChronic"),
+        "max": acute.get("maxTrainingLoadChronic"),
+        "ratio": acute.get("dailyAcuteChronicWorkloadRatio"),
+        "status": acute.get("acwrStatus"),
+        "focus": focus,
+    }
+
+
+def build_training_load_html(tl):
+    """Card stile Garmin: carico acuto sulla fascia ottimale, sotto il focus carico delle ultime 4 settimane."""
+    if not tl:
+        return '<div class="missing">Garmin non ha restituito il carico di allenamento.</div>'
+    parts = []
+    if tl["acute"] is not None and tl["min"] and tl["max"]:
+        top = max(tl["max"] * 1.3, tl["acute"] * 1.1)
+        pct = lambda v: f"{min(v / top * 100, 100):.1f}%"
+        label, color = {"OPTIMAL": ("Ottimale", "#68d391"), "LOW": ("Basso", "#63b3ed"), "HIGH": ("Alto", "#f6ad55"), "VERY_HIGH": ("Molto alto", "#f56565")}.get(tl["status"], ("", "#a0a0a5"))
+        ratio = f" · rapporto acuto/cronico {tl['ratio']:g}" if tl["ratio"] is not None else ""
+        parts.append(
+            f'<div class="tl-head"><span class="tl-num">{round(tl["acute"])}</span><span style="color:{color}">{label}</span></div>'
+            f'<div class="tl-bar" role="img" aria-label="Carico acuto {round(tl["acute"])}, fascia ottimale {round(tl["min"])}-{round(tl["max"])}">'
+            f'<div class="tl-zone" style="left:{pct(tl["min"])};width:calc({pct(tl["max"])} - {pct(tl["min"])})"></div>'
+            f'<div class="tl-dot" style="left:{pct(tl["acute"])}"></div></div>'
+            f'<div class="tl-scale"><span style="left:{pct(tl["min"])}">{round(tl["min"])}</span><span style="left:{pct(tl["max"])}">{round(tl["max"])}</span></div>'
+            f'<div class="tl-note">Carico acuto (ultimi 7 giorni){ratio}. La fascia verde è la zona ottimale.</div>'
+        )
+    if tl["focus"]:
+        top = max(max(f["value"], f["max"] or 0) for f in tl["focus"]) * 1.15
+        pct = lambda v: f"{v / top * 100:.1f}%"
+        rows, short = [], []
+        for f in tl["focus"]:
+            zone = f'<div class="tl-target" style="left:{pct(f["min"])};width:calc({pct(f["max"])} - {pct(f["min"])})"></div>' if f["min"] is not None and f["max"] is not None else ""
+            rows.append(f'<div class="tl-frow"><div class="tl-flabel"><span>{f["label"]}</span><span>{f["value"]}</span></div>'
+                        f'<div class="tl-fbar"><div style="width:{pct(f["value"])};background:{f["color"]}"></div>{zone}</div></div>')
+            if f["min"] is not None and f["value"] < f["min"]:
+                short.append(f["label"].lower())
+        verdict = (f'<div class="tl-note warn">Carenza: {", ".join(short)}.</div>' if short
+                   else '<div class="tl-note">Carico ben distribuito.</div>')
+        parts.append(f'<h3 class="tl-sub">Focus carico · ultime 4 settimane</h3>{"".join(rows)}'
+                     f'<div class="tl-note">Il riquadro tratteggiato è il range consigliato da Garmin.</div>{verdict}')
+    return "".join(parts)
 
 
 def fetch_vo2max(client, since_days, every_days):
@@ -662,9 +725,9 @@ def compute_weekly_mileage(activities, weeks):
         mondays.append(d)
         d += timedelta(weeks=1)
     values = [round(weekly.get(iso_week_key(m), 0.0), 1) for m in mondays]
-    slope, intercept = linreg(list(range(len(values))), values)
-    trend = [round(intercept + slope * i, 1) for i in range(len(values))]
-    return {"labels": [f"{m:%d/%m}" for m in mondays], "values": values, "trend": trend}
+    # media delle 4 settimane prima: la barra sopra la linea vuol dire "più del solito"
+    avg4 = [round(sum(values[i - 4:i]) / 4, 1) if i >= 4 else None for i in range(len(values))]
+    return {"labels": [f"{m:%d/%m}" for m in mondays], "values": values, "avg4": avg4}
 
 
 def classify_effort(a, pb_5k_pace_sec_km):
@@ -932,6 +995,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .panel h2 abbr {{ text-decoration: none; color: var(--muted); font-weight: 400; font-size: 14px; }}
   .panel .desc {{ color: var(--muted); font-size: 13px; margin-bottom: 14px; max-width: 75ch; }}
   .panel.full {{ grid-column: 1 / -1; }}
+  .tl-head {{ display: flex; align-items: baseline; gap: 10px; font-size: 14px; }}
+  .tl-num {{ font-size: 34px; font-weight: 700; }}
+  .tl-bar {{ position: relative; height: 12px; border-radius: 6px; background: #2c2c2e; margin: 12px 0 4px; }}
+  .tl-zone {{ position: absolute; top: 0; bottom: 0; background: #2f855a; }}
+  .tl-dot {{ position: absolute; top: 50%; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; background: #fff; border: 2px solid #000; }}
+  .tl-scale {{ position: relative; height: 16px; font-size: 12px; color: var(--muted); }}
+  .tl-scale span {{ position: absolute; transform: translateX(-50%); }}
+  .tl-note {{ color: var(--muted); font-size: 12px; margin-top: 6px; }}
+  .tl-note.warn {{ color: #f6ad55; }}
+  .tl-sub {{ font-size: 14px; margin: 20px 0 8px; font-weight: 600; }}
+  .tl-frow {{ margin-bottom: 10px; }}
+  .tl-flabel {{ display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }}
+  .tl-fbar {{ position: relative; height: 10px; border-radius: 5px; background: #2c2c2e; }}
+  .tl-fbar > div:first-child {{ height: 100%; border-radius: 5px; }}
+  .tl-target {{ position: absolute; top: -3px; bottom: -3px; border: 1px dashed #fff; border-radius: 3px; }}
+  .stress-legend {{ display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-top: 8px; }}
+  .stress-legend i {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }}
   .missing {{ color: var(--muted); font-size: 13px; font-style: italic; padding: 20px 0; text-align: center; }}
   .table-wrap {{ overflow-x: auto; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
@@ -1134,12 +1214,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Freschezza" onclick="openEnlarge('tsb')"><h2>Freschezza <abbr>TSB</abbr></h2><div class="desc">Forma fisica meno fatica. Sotto −20 molto stanco, tra −10 e +5 zona di allenamento, sopra +5 fresco per gareggiare.</div>{tsb_chart_or_missing}</div>
     </div>
     <div class="grid" style="margin-top:18px;">
-      <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Chilometraggio settimanale" onclick="openEnlarge('mileage')"><h2>Chilometraggio settimanale</h2><div class="desc">Ultime {weeks_trend} settimane di corsa (la data è il lunedì), con la linea di tendenza.</div>{mileage_chart_or_missing}</div>
+      <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Chilometraggio settimanale" onclick="openEnlarge('mileage')"><h2>Chilometraggio settimanale</h2><div class="desc">Ultime {weeks_trend} settimane di corsa (la data è il lunedì). La linea è la media delle 4 settimane prima; la settimana in corso è tratteggiata.</div>{mileage_chart_or_missing}</div>
+      <div class="panel"><h2>Carico di allenamento</h2><div class="desc">Dati ufficiali Garmin, come sull'orologio.</div>{training_load_html}</div>
     </div>
   </div>
 
   <div class="section" id="section-recovery" role="tabpanel" aria-labelledby="tab-recovery">
     <div class="grid">
+      <div class="panel full"><h2>Stress</h2>
+        <div class="range-btns" role="group" aria-label="Periodo stress"><button class="range-btn" aria-pressed="true" onclick="showStress('day', this)">{stress_day_title}</button><button class="range-btn" aria-pressed="false" onclick="showStress('week', this)">Settimana</button></div>
+        <div id="stress-day"><div class="desc">Un valore ogni 3 minuti, come nell'app Garmin. Buchi = attività o orologio non indossato.</div>{stress_day_chart_or_missing}</div>
+        <div id="stress-week" hidden><div class="desc">Stress medio di ogni giorno negli ultimi 7 giorni.</div>{stress_week_chart_or_missing}</div>
+        <div class="stress-legend"><span><i style="background:#3b82f6"></i>Riposo 0-25</span><span><i style="background:#f6ad55"></i>Basso 26-50</span><span><i style="background:#ed8936"></i>Medio 51-75</span><span><i style="background:#c05621"></i>Alto 76-100</span></div>
+      </div>
+    </div>
+    <div class="grid" style="margin-top:18px;">
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico HRV" onclick="openEnlarge('hrv')"><h2>Variabilità cardiaca <abbr>HRV</abbr></h2><div class="desc">Ultime {recovery_weeks} settimane. Valori stabili o in salita indicano un buon recupero.</div>{hrv_chart_or_missing}</div>
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico FC a riposo" onclick="openEnlarge('rhr')"><h2>FC a riposo</h2><div class="desc">Ultime {recovery_weeks} settimane. Se sale di 5 o più battiti per qualche giorno, il corpo chiede riposo.</div>{rhr_chart_or_missing}</div>
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Sonno" onclick="openEnlarge('sleep')"><h2>Sonno</h2><div class="desc">Ore di sonno per notte.</div>{sleep_chart_or_missing}</div>
@@ -1271,8 +1360,9 @@ try {{
       try {{
         const meta = chart.getDatasetMeta(0);
         const opts = chart.options && chart.options.plugins && chart.options.plugins.barValueLabel;
-        const formatter = opts && opts.formatter;
-        if (!formatter || !meta || !meta.data) return;
+        // un flag, non una funzione: Chart.js chiamerebbe da solo le funzioni nelle opzioni
+        if (!opts || !opts.show || !meta || !meta.data) return;
+        const formatter = (v) => v ? String(Math.round(v)) : '';
         const ctx = chart.ctx;
         ctx.save();
         ctx.fillStyle = '#e8eaf2';
@@ -1299,6 +1389,12 @@ const DASH_DATA = {{}};
 let enlargeChart = null;
 let currentEnlargeId = null;
 let currentTs = null;
+
+function showStress(which, btn) {{
+  document.getElementById('stress-day').hidden = which !== 'day';
+  document.getElementById('stress-week').hidden = which !== 'week';
+  btn.parentNode.querySelectorAll('.range-btn').forEach(b => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
+}}
 
 function registerChart(id, labels, datasets, type, title, hasToday, weekly) {{
   DASH_DATA[id] = {{ labels, datasets, type, title, hasToday: !!hasToday, weekly: !!weekly }};
@@ -1968,7 +2064,9 @@ def main():
     running_activities = [a for a in activities if is_running(a)]
     print(f"  -> di cui {len(running_activities)} corse")
 
-    rhr_series, sleep_series, hrv_series = fetch_daily_wellness(client, RECOVERY_LOOKBACK_DAYS)
+    rhr_series, sleep_series, hrv_series, stress_series = fetch_daily_wellness(client, RECOVERY_LOOKBACK_DAYS)
+    stress_day = fetch_stress_day(client)
+    training_load = fetch_training_load(client)
     vo2_series = fetch_vo2max(client, WEEKS_TREND * 7, VO2_SAMPLE_EVERY_DAYS)
 
     print("  -> Scarico profilo, record, previsioni e gare in calendario...")
@@ -2068,21 +2166,51 @@ new Chart(document.getElementById('{elem_id}'), {{
 
     has_mileage = len(mileage["values"]) > 0
     if has_mileage:
+        n_weeks = len(mileage["values"])
+        # la settimana in corso è a metà: solo contorno tratteggiato
+        fills = json.dumps(["#4fd1c5"] * (n_weeks - 1) + ["rgba(79,209,197,0.15)"])
         chart_scripts.append(f"""
 try {{
 new Chart(document.getElementById('mileageChart'), {{
   type: 'bar',
   data: {{ labels: {json.dumps(mileage['labels'])}, datasets: [
-    {{ label: 'km settimanali', data: {json.dumps(mileage['values'])}, backgroundColor: '#4fd1c5', borderRadius: 5 }},
-    {{ label: 'tendenza', data: {json.dumps(mileage['trend'])}, type: 'line', borderColor: '#f6ad55', backgroundColor: 'transparent', pointRadius: 0 }}
+    {{ label: 'km', data: {json.dumps(mileage['values'])}, backgroundColor: {fills}, borderColor: '#4fd1c5', borderWidth: {json.dumps([0] * (n_weeks - 1) + [1.5])}, borderDash: [4, 3], borderRadius: 5, order: 2 }},
+    {{ label: 'media 4 settimane prima', data: {json.dumps(mileage['avg4'])}, type: 'line', borderColor: '#f6ad55', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true, order: 1 }}
   ] }},
-  options: {{ responsive: true, interaction: {{ mode: 'index', intersect: false }}, plugins: {{ legend: {{ display: true }}, tooltip: {{ enabled: true, mode: 'index', intersect: false }} }}, scales: {{ x: {{ grid: {{ display: false }}, {x_ticks} }}, y: {{ grid: {{ color: '#2c2c2e' }} }} }} }}
+  options: {{ responsive: true, layout: {{ padding: {{ top: 18 }} }}, interaction: {{ mode: 'index', intersect: false }},
+    plugins: {{ legend: {{ display: true, labels: {{ boxWidth: 12 }} }}, barValueLabel: {{ show: true }}, tooltip: {{ enabled: true, mode: 'index', intersect: false, callbacks: {{ label: (c) => c.dataset.label + ': ' + c.raw + ' km' }} }} }},
+    scales: {{ x: {{ grid: {{ display: false }}, ticks: {{ maxRotation: 0, autoSkip: true }} }}, y: {{ grid: {{ color: '#2c2c2e' }}, beginAtZero: true }} }} }}
 }});
 }} catch(e) {{ console.error('Errore grafico mileageChart', e); }}""")
         chart_scripts.append(f"try {{ registerChart('mileage', {json.dumps(mileage['labels'])}, [{{label:'km settimanali', data:{json.dumps(mileage['values'])}, backgroundColor:'#4fd1c5'}}], 'bar', 'Chilometraggio settimanale', false, true); }} catch(e) {{ console.error('registerChart mileage', e); }}")
 
+    stress_color = "(v) => v === null ? '#3a3a3c' : v <= 25 ? '#3b82f6' : v <= 50 ? '#f6ad55' : v <= 75 ? '#ed8936' : '#c05621'"
+    if stress_day:
+        chart_scripts.append(f"""
+try {{
+const sv = {json.dumps(stress_day['values'])}, sc = {stress_color};
+new Chart(document.getElementById('stressDayChart'), {{
+  type: 'bar',
+  data: {{ labels: {json.dumps(stress_day['labels'])}, datasets: [{{ label: 'Stress', data: sv, backgroundColor: sv.map(sc), barPercentage: 1, categoryPercentage: 1 }}] }},
+  options: {{ responsive: true, plugins: {{ legend: {{ display: false }}, tooltip: {{ enabled: true, mode: 'index', intersect: false }} }},
+    scales: {{ x: {{ grid: {{ display: false }}, ticks: {{ maxRotation: 0, autoSkip: true, maxTicksLimit: 7 }} }}, y: {{ min: 0, max: 100, grid: {{ color: '#2c2c2e' }}, ticks: {{ stepSize: 25 }} }} }} }}
+}});
+}} catch(e) {{ console.error('Errore grafico stressDayChart', e); }}""")
+    if stress_series:
+        week = stress_series[-7:]
+        chart_scripts.append(f"""
+try {{
+const wv = {json.dumps([p['value'] for p in week])}, sc = {stress_color};
+new Chart(document.getElementById('stressWeekChart'), {{
+  type: 'bar',
+  data: {{ labels: {json.dumps([fmt_day(p['date']) for p in week])}, datasets: [{{ label: 'Stress medio', data: wv, backgroundColor: wv.map(sc), borderRadius: 5 }}] }},
+  options: {{ responsive: true, layout: {{ padding: {{ top: 18 }} }}, plugins: {{ legend: {{ display: false }}, barValueLabel: {{ show: true }}, tooltip: {{ enabled: true, mode: 'index', intersect: false }} }},
+    scales: {{ x: {{ grid: {{ display: false }} }}, y: {{ min: 0, max: 100, grid: {{ color: '#2c2c2e' }}, ticks: {{ stepSize: 25 }} }} }} }}
+}});
+}} catch(e) {{ console.error('Errore grafico stressWeekChart', e); }}""")
+
     if sleep_series:
-        sleep_has_today = sleep_series[-1]["date"] == today.isoformat()
+        sleep_has_today =sleep_series[-1]["date"] == today.isoformat()
         sleep_labels = [fmt_day(p['date']) for p in sleep_series]
         chart_scripts.append(f"""
 try {{
@@ -2139,6 +2267,10 @@ new Chart(document.getElementById('sleepChart'), {{
         "hrv_chart_or_missing": render_or_missing(len(hrv_series) > 0, canvas("hrvChart", f"Grafico HRV, ultimo valore {card_hrv}"), "Nessun dato HRV trovato."),
         "rhr_chart_or_missing": render_or_missing(len(rhr_series) > 0, canvas("rhrChart", f"Grafico FC a riposo, ultimo valore {card_rhr}"), "Nessun dato di FC a riposo trovato."),
         "sleep_chart_or_missing": render_or_missing(len(sleep_series) > 0, canvas("sleepChart", f"Ore di sonno, ultima notte {last(sleep_series, 'hours')} ore"), "Nessun dato di sonno trovato."),
+        "stress_day_title": ("Oggi" if stress_day["date"] == today.isoformat() else "Ieri") if stress_day else "Oggi",
+        "stress_day_chart_or_missing": render_or_missing(bool(stress_day), canvas("stressDayChart", f"Stress durante il giorno, media {stress_day['avg'] if stress_day else '—'}"), "Nessun dato di stress trovato."),
+        "stress_week_chart_or_missing": render_or_missing(bool(stress_series), canvas("stressWeekChart", f"Stress medio degli ultimi 7 giorni, ultimo valore {last(stress_series)}"), "Nessun dato di stress trovato."),
+        "training_load_html": build_training_load_html(training_load),
         "chart_scripts": "\n".join(chart_scripts),
         "chartjs_source": chartjs_source,
         "activity_timeseries_json": json_for_script(activity_timeseries),
