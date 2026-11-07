@@ -963,7 +963,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .insight:first-child h2 {{ font-size: 19px; }}
   .insight:first-child p {{ font-size: 14px; color: var(--text); max-width: 75ch; }}
 
-  .week-row {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }}
+  .week-row {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; margin-bottom: 22px; }}
   .day-box {{ background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 10px 4px; text-align: center; }}
   .day-box.today {{ border-color: var(--accent); }}
   .day-box .d {{ font-size: 12px; color: var(--muted); }}
@@ -974,13 +974,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .day-box .act.run {{ color: #f56565; font-weight: 600; }}
   .day-box .act.gym {{ color: #63b3ed; font-weight: 600; }}
   .day-box .act.stretch {{ color: #b794f4; font-weight: 600; }}
-  .day-box.easy .km {{ color: var(--good); }}
-  .day-box.workout .km {{ color: var(--accent2); }}
   .day-box.rest .km {{ color: var(--muted); }}
-  .legend {{ display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 8px 0 22px 0; }}
-  .legend span::before {{ content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }}
-  .legend .easy::before {{ background: var(--good); }}
-  .legend .workout::before {{ background: var(--accent2); }}
 
   .tabs {{ display: flex; gap: 4px; border-bottom: 1px solid var(--panel-border); margin-bottom: 16px; }}
   .tabbtn {{ background: transparent; border: none; color: var(--muted); font-size: 14px; padding: 10px 16px; cursor: pointer; font-family: inherit; border-bottom: 2px solid transparent; margin-bottom: -1px; }}
@@ -1203,7 +1197,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="insights" id="insights">{insights_html}</div>
 
   <div class="week-row" aria-label="Questa settimana">{week_row_html}</div>
-  <div class="legend" aria-hidden="true"><span class="easy">Facile</span><span class="workout">Allenamento</span><span class="rest">Riposo</span></div>
   </div>
 
   <nav class="tabs" role="tablist" aria-label="Sezioni">
