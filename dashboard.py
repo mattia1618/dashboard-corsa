@@ -971,6 +971,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .day-box .km {{ font-size: 16px; font-weight: 700; margin-top: 2px; }}
   .day-box .act {{ font-size: 12px; color: var(--text); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
   .day-box .act + .km {{ margin-top: 0; }}
+  .day-box .act.run {{ color: #f56565; font-weight: 600; }}
+  .day-box .act.gym {{ color: #63b3ed; font-weight: 600; }}
+  .day-box .act.stretch {{ color: #b794f4; font-weight: 600; }}
   .day-box.easy .km {{ color: var(--good); }}
   .day-box.workout .km {{ color: var(--accent2); }}
   .day-box.rest .km {{ color: var(--muted); }}
@@ -2233,7 +2236,8 @@ new Chart(document.getElementById('sleepChart'), {{
         insights_html = '<div class="insight info"><h2>Dati insufficienti</h2><p>Servono più allenamenti registrati per generare consigli automatici.</p></div>'
 
     def day_html(d):
-        parts = ([f'<div class="act">Corsa</div><div class="km">{d["km"]}</div>'] if d["run"] else []) + [f'<div class="act">{escape(o)}</div>' for o in d["others"]]
+        tint = {"Palestra": " gym", "Stretching": " stretch"}
+        parts = ([f'<div class="act run">Corsa</div><div class="km">{d["km"]}</div>'] if d["run"] else []) + [f'<div class="act{tint.get(o, "")}">{escape(o)}</div>' for o in d["others"]]
         said = (["corsa " + str(d["km"]) + " km"] if d["run"] else []) + [o.lower() for o in d["others"]]
         return (f'<div class="day-box {d["kind"]}" data-date="{d["date"]}" aria-label="{d["label"]}: {", ".join(said) or "riposo"}">'
                 f'<div class="d">{d["label"]}</div>{"".join(parts) or "<div class=km>—</div>"}</div>')
