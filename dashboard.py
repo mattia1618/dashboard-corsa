@@ -717,7 +717,7 @@ def compute_weekly_mileage(activities, weeks):
         weekly[wk] = weekly.get(wk, 0.0) + (a.get("distance") or 0) / 1000.0
 
     if not weekly:
-        return {"labels": [], "values": [], "trend": []}
+        return {"labels": [], "values": [], "avg": 0}
     # tutte le settimane, anche quelle a 0 km, così non spariscono barre
     mondays = []
     d = start - timedelta(days=start.weekday())
@@ -725,9 +725,9 @@ def compute_weekly_mileage(activities, weeks):
         mondays.append(d)
         d += timedelta(weeks=1)
     values = [round(weekly.get(iso_week_key(m), 0.0), 1) for m in mondays]
-    # media delle 4 settimane prima: la barra sopra la linea vuol dire "più del solito"
-    avg4 = [round(sum(values[i - 4:i]) / 4, 1) if i >= 4 else None for i in range(len(values))]
-    return {"labels": [f"{m:%d/%m}" for m in mondays], "values": values, "avg4": avg4}
+    # media delle sole settimane complete: quella in corso la abbasserebbe
+    done = values[:-1] or values
+    return {"labels": [f"{m:%d/%m}" for m in mondays], "values": values, "avg": round(sum(done) / len(done), 1)}
 
 
 def classify_effort(a, pb_5k_pace_sec_km):
@@ -1214,7 +1214,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Freschezza" onclick="openEnlarge('tsb')"><h2>Freschezza <abbr>TSB</abbr></h2><div class="desc">Forma fisica meno fatica. Sotto −20 molto stanco, tra −10 e +5 zona di allenamento, sopra +5 fresco per gareggiare.</div>{tsb_chart_or_missing}</div>
     </div>
     <div class="grid" style="margin-top:18px;">
-      <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Chilometraggio settimanale" onclick="openEnlarge('mileage')"><h2>Chilometraggio settimanale</h2><div class="desc">Ultime {weeks_trend} settimane di corsa (la data è il lunedì). La linea è la media delle 4 settimane prima; la settimana in corso è tratteggiata.</div>{mileage_chart_or_missing}</div>
+      <div class="panel chart-panel" role="button" tabindex="0" aria-label="Ingrandisci il grafico Chilometraggio settimanale" onclick="openEnlarge('mileage')"><h2>Chilometraggio settimanale</h2><div class="desc">Ultime {weeks_trend} settimane di corsa (la data è il lunedì). Azzurro = sopra la tua media (linea tratteggiata), grigio = sotto; la settimana in corso è tratteggiata.</div>{mileage_chart_or_missing}</div>
       <div class="panel"><h2>Carico di allenamento</h2><div class="desc">Dati ufficiali Garmin, come sull'orologio.</div>{training_load_html}</div>
     </div>
   </div>
@@ -2166,23 +2166,25 @@ new Chart(document.getElementById('{elem_id}'), {{
 
     has_mileage = len(mileage["values"]) > 0
     if has_mileage:
-        n_weeks = len(mileage["values"])
-        # la settimana in corso è a metà: solo contorno tratteggiato
-        fills = json.dumps(["#4fd1c5"] * (n_weeks - 1) + ["rgba(79,209,197,0.15)"])
+        n_weeks, avg = len(mileage["values"]), mileage["avg"]
+        sky = "#7dd3fc"
+        # azzurro sopra la tua media, grigio sotto; la settimana in corso è a metà: solo contorno tratteggiato
+        fills = json.dumps([sky if v >= avg else "#3a3a3c" for v in mileage["values"][:-1]] + ["rgba(125,211,252,0.15)"])
         chart_scripts.append(f"""
 try {{
 new Chart(document.getElementById('mileageChart'), {{
   type: 'bar',
   data: {{ labels: {json.dumps(mileage['labels'])}, datasets: [
-    {{ label: 'km', data: {json.dumps(mileage['values'])}, backgroundColor: {fills}, borderColor: '#4fd1c5', borderWidth: {json.dumps([0] * (n_weeks - 1) + [1.5])}, borderDash: [4, 3], borderRadius: 5, order: 2 }},
-    {{ label: 'media 4 settimane prima', data: {json.dumps(mileage['avg4'])}, type: 'line', borderColor: '#f6ad55', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true, order: 1 }}
+    {{ label: 'km', data: {json.dumps(mileage['values'])}, backgroundColor: {fills}, borderColor: '{sky}', borderWidth: {json.dumps([0] * (n_weeks - 1) + [1.5])}, borderDash: [4, 3], borderRadius: 5, order: 2 }},
+    {{ label: 'media {avg:g} km', data: {json.dumps([avg] * n_weeks)}, type: 'line', borderColor: '#8e8e93', borderDash: [5, 4], borderWidth: 1.5, backgroundColor: 'transparent', pointRadius: 0, order: 1 }}
   ] }},
   options: {{ responsive: true, layout: {{ padding: {{ top: 18 }} }}, interaction: {{ mode: 'index', intersect: false }},
-    plugins: {{ legend: {{ display: true, labels: {{ boxWidth: 12 }} }}, barValueLabel: {{ show: true }}, tooltip: {{ enabled: true, mode: 'index', intersect: false, callbacks: {{ label: (c) => c.dataset.label + ': ' + c.raw + ' km' }} }} }},
+    plugins: {{ legend: {{ display: false }}, zones: [{{ from: {avg * 0.9:.1f}, to: {avg * 1.1:.1f}, color: 'rgba(255,255,255,0.06)' }}], barValueLabel: {{ show: true }},
+      tooltip: {{ enabled: true, mode: 'index', intersect: false, callbacks: {{ label: (c) => c.datasetIndex ? 'media: ' + c.raw + ' km' : 'km: ' + c.raw }} }} }},
     scales: {{ x: {{ grid: {{ display: false }}, ticks: {{ maxRotation: 0, autoSkip: true }} }}, y: {{ grid: {{ color: '#2c2c2e' }}, beginAtZero: true }} }} }}
 }});
 }} catch(e) {{ console.error('Errore grafico mileageChart', e); }}""")
-        chart_scripts.append(f"try {{ registerChart('mileage', {json.dumps(mileage['labels'])}, [{{label:'km settimanali', data:{json.dumps(mileage['values'])}, backgroundColor:'#4fd1c5'}}], 'bar', 'Chilometraggio settimanale', false, true); }} catch(e) {{ console.error('registerChart mileage', e); }}")
+        chart_scripts.append(f"try {{ registerChart('mileage', {json.dumps(mileage['labels'])}, [{{label:'km settimanali', data:{json.dumps(mileage['values'])}, backgroundColor:'#7dd3fc'}}], 'bar', 'Chilometraggio settimanale', false, true); }} catch(e) {{ console.error('registerChart mileage', e); }}")
 
     stress_color = "(v) => v === null ? '#3a3a3c' : v <= 25 ? '#3b82f6' : v <= 50 ? '#f6ad55' : v <= 75 ? '#ed8936' : '#c05621'"
     if stress_day:
