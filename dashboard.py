@@ -968,7 +968,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .day-box.today {{ border-color: var(--accent); }}
   .day-box .d {{ font-size: 12px; color: var(--muted); }}
   .day-box.today .d {{ color: var(--accent); font-weight: 600; }}
-  .day-box .km {{ font-size: 16px; font-weight: 700; margin-top: 2px; }}
+  .day-box .km {{ font-size: 16px; font-weight: 700; margin-top: 2px; color: var(--muted); }}
   .day-box .act {{ font-size: 12px; color: var(--text); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
   .day-box .act + .km {{ margin-top: 0; }}
   .day-box .act.run {{ color: #f56565; font-weight: 600; }}
