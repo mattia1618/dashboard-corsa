@@ -2,7 +2,7 @@
 """
 pubblica.py — Aggiorna la dashboard e la mette online, protetta da password.
 
-Lo lancia Windows da solo (Utilità di pianificazione) ogni 2 ore e all'accesso.
+Lo lancia Windows da solo (Utilità di pianificazione) ogni ora e all'accesso.
 Garmin blocca i server di GitHub, quindi i dati li scarica questo PC.
 
 Passi: dashboard.py -> StatiCrypt (password) -> push sul ramo gh-pages.
@@ -34,6 +34,8 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # niente finestre nere c
 def run(cmd, log, **kw):
     log.write(f"$ {' '.join(cmd[:3])} ...\n")
     log.flush()
+    # un passaggio bloccato (es. login GitHub invisibile) non deve fermare i giri dopo
+    kw.setdefault("timeout", 15 * 60)
     subprocess.run(cmd, check=True, stdout=log, stderr=subprocess.STDOUT, creationflags=NO_WINDOW, **kw)
 
 
@@ -52,7 +54,8 @@ def main():
 
         try:
             python = sys.executable.replace("pythonw.exe", "python.exe")
-            run([python, "-X", "utf8", "dashboard.py"], log, cwd=DIR)
+            # -u: il log mostra fin dove arriva
+            run([python, "-u", "-X", "utf8", "dashboard.py"], log, cwd=DIR)
 
             # i file .git sono in sola lettura su Windows: la pulizia può fallire senza danni
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
