@@ -215,7 +215,7 @@ SPORT_LABELS = {
     "lap_swimming": "Nuoto", "open_water_swimming": "Nuoto (acque libere)",
     "walking": "Camminata", "hiking": "Escursione",
     "strength_training": "Palestra", "fitness_equipment": "Palestra",
-    "cardio_training": "Cardio", "yoga": "Yoga", "elliptical": "Ellittica",
+    "cardio_training": "Cardio", "yoga": "Stretching", "elliptical": "Ellittica",
     "other": "Altro",
 }
 
@@ -745,12 +745,12 @@ def classify_effort(a, pb_5k_pace_sec_km):
     return "easy"
 
 
-def build_week_row(running_activities, pb_5k_pace_sec_km):
+def build_week_row(activities, pb_5k_pace_sec_km):
     today = date.today()
     monday = today - timedelta(days=today.weekday())
     days = [monday + timedelta(days=i) for i in range(7)]
     by_day = {d: [] for d in days}
-    for a in running_activities:
+    for a in activities:
         try:
             dt = datetime.strptime(a.get("startTimeLocal"), "%Y-%m-%d %H:%M:%S")
         except Exception:
@@ -760,14 +760,15 @@ def build_week_row(running_activities, pb_5k_pace_sec_km):
 
     result = []
     for i, d in enumerate(days):
-        acts = by_day[d]
-        km = sum((a.get("distance") or 0) / 1000.0 for a in acts)
-        if not acts:
-            kind = "rest"
+        runs = [a for a in by_day[d] if is_running(a)]
+        km = sum((a.get("distance") or 0) / 1000.0 for a in runs)
+        # le altre attività compaiono per nome (Palestra, Stretching...), una volta sola per tipo
+        others = list(dict.fromkeys(sport_label(a) for a in by_day[d] if not is_running(a)))
+        if runs:
+            kind = classify_effort(max(runs, key=lambda a: a.get("distance") or 0), pb_5k_pace_sec_km)
         else:
-            main = max(acts, key=lambda a: a.get("distance") or 0)
-            kind = classify_effort(main, pb_5k_pace_sec_km)
-        result.append({"label": GIORNI_IT[i], "km": round(km, 1), "kind": kind, "date": d.isoformat()})
+            kind = "other" if others else "rest"
+        result.append({"label": GIORNI_IT[i], "km": round(km, 1), "run": bool(runs), "others": others, "kind": kind, "date": d.isoformat()})
     return result
 
 
@@ -968,6 +969,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .day-box .d {{ font-size: 12px; color: var(--muted); }}
   .day-box.today .d {{ color: var(--accent); font-weight: 600; }}
   .day-box .km {{ font-size: 16px; font-weight: 700; margin-top: 2px; }}
+  .day-box .act {{ font-size: 12px; color: var(--text); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .day-box .act + .km {{ margin-top: 0; }}
   .day-box.easy .km {{ color: var(--good); }}
   .day-box.workout .km {{ color: var(--accent2); }}
   .day-box.rest .km {{ color: var(--muted); }}
@@ -2085,7 +2088,7 @@ def main():
 
     pb_5k_sec = next((r["seconds"] for r in profile["records"] if r["label"] == "5 km"), ATHLETE["pb_5k_sec"])
     pb_5k_pace_sec_km = pb_5k_sec / 5.0
-    week_row = build_week_row(running_activities, pb_5k_pace_sec_km)
+    week_row = build_week_row(activities, pb_5k_pace_sec_km)
 
     today = date.today()
     insights = compute_insights(mileage, vo2_series)
@@ -2229,12 +2232,12 @@ new Chart(document.getElementById('sleepChart'), {{
     else:
         insights_html = '<div class="insight info"><h2>Dati insufficienti</h2><p>Servono più allenamenti registrati per generare consigli automatici.</p></div>'
 
-    kind_labels = {"easy": "facile", "workout": "allenamento", "rest": "riposo"}
-    week_row_html = "\n".join(
-        f'<div class="day-box {d["kind"]}" data-date="{d["date"]}" aria-label="{d["label"]}: {str(d["km"]) + " km, " if d["km"] else ""}{kind_labels[d["kind"]]}">'
-        f'<div class="d">{d["label"]}</div><div class="km">{d["km"] if d["km"] else "—"}</div></div>'
-        for d in week_row
-    )
+    def day_html(d):
+        parts = ([f'<div class="act">Corsa</div><div class="km">{d["km"]}</div>'] if d["run"] else []) + [f'<div class="act">{escape(o)}</div>' for o in d["others"]]
+        said = (["corsa " + str(d["km"]) + " km"] if d["run"] else []) + [o.lower() for o in d["others"]]
+        return (f'<div class="day-box {d["kind"]}" data-date="{d["date"]}" aria-label="{d["label"]}: {", ".join(said) or "riposo"}">'
+                f'<div class="d">{d["label"]}</div>{"".join(parts) or "<div class=km>—</div>"}</div>')
+    week_row_html = "\n".join(day_html(d) for d in week_row)
 
     def canvas(elem_id, label):
         return f'<canvas id="{elem_id}" role="img" aria-label="{label}"></canvas>'
