@@ -1161,7 +1161,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .top-grid {{ grid-template-columns: 1fr; }}
   }}
   @media (max-width: 640px) {{
-    body {{ padding: 16px; }}
+    body {{ padding: 16px 16px calc(var(--tabbar-h) + 24px + env(safe-area-inset-bottom)); }}  /* il fondo resta libero per la barra schede */
     .hero {{ padding: 18px; }}
     .stat-cards {{ display: flex; overflow-x: auto; scroll-snap-type: x mandatory; scrollbar-width: none; margin: 0 -16px; padding: 0 16px; scroll-padding: 0 16px; }}
     .stat-card {{ flex: 0 0 150px; scroll-snap-align: start; }}
